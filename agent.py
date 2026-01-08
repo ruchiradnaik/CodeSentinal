@@ -1,78 +1,115 @@
 import os
+import operator
+from typing import Annotated, TypedDict, Union
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage
-from langgraph.checkpoint.memory import MemorySaver 
-from langgraph.graph import START, MessagesState, StateGraph
-from executor import PythonExecutor # Matches the class above
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
+from langgraph.graph import START, END, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
+from executor import PythonExecutor
 from dotenv import load_dotenv
 
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPEN_API_KEY")
-print(f"API Key loaded: {OPENAI_API_KEY[:10]}..." if OPENAI_API_KEY else "API Key is None!")
+
+# --- 1. Define the State ---
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], operator.add]
+    code: str              # The code currently being tested
+    error: str             # The error from the last execution
+    iterations: int        # To prevent infinite loops
 
 class CodeSentinel:
     def __init__(self):
-        # Use your actual key here
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key= OPENAI_API_KEY)
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
         self.executor = PythonExecutor()
         self.memory = MemorySaver()
+        self.max_iterations = 3
+
+        # --- 2. Build the Graph ---
+        workflow = StateGraph(AgentState)
+
+        # Nodes
+        workflow.add_node("generate", self.generate_solution)
+        workflow.add_node("execute", self.run_code)
         
-        workflow = StateGraph(MessagesState)
-        workflow.add_node("agent", self.call_model)
-        workflow.add_edge(START, "agent")
+        # Edges
+        workflow.add_edge(START, "generate")
+        workflow.add_edge("generate", "execute")
         
+        # Conditional Edge: Decide next step based on execution result
+        workflow.add_conditional_edges(
+            "execute",
+            self.decide_next_step,
+            {
+                "retry": "generate",
+                "finish": END
+            }
+        )
+
         self.app = workflow.compile(checkpointer=self.memory)
 
-    def call_model(self, state: MessagesState):
-        response = self.llm.invoke(state["messages"])
-        return {"messages": [response]}
+    # --- Node: Generate Solution ---
+    def generate_solution(self, state: AgentState):
+        messages = state["messages"]
+        error = state.get("error", "")
+        
+        # If there is an error from a previous run, add it to context
+        if error:
+            messages.append(HumanMessage(content=f"The previous code failed with this error: {error}. Please fix it."))
+
+        response = self.llm.invoke(messages)
+        
+        # Extract code from markdown blocks
+        content = response.content
+        code = ""
+        if "```python" in content:
+            code = content.split("```python")[1].split("```")[0].strip()
+        
+        return {
+            "messages": [response], 
+            "code": code, 
+            "iterations": state.get("iterations", 0) + 1
+        }
+
+    # --- Node: Execute Code ---
+    def run_code(self, state: AgentState):
+        code = state["code"]
+        if not code:
+            return {"error": "No code generated"}
+            
+        print(f"⚙️ Executing code... (Iteration {state['iterations']})")
+        result = self.executor.execute(code)
+        
+        return {"error": result["error"] if not result["success"] else None}
+
+    # --- Conditional Logic ---
+    def decide_next_step(self, state: AgentState):
+        error = state.get("error")
+        iterations = state.get("iterations")
+
+        if not error:
+            print("✅ Success! Code works.")
+            return "finish"
+        
+        if iterations >= self.max_iterations:
+            print("❌ Max retries reached. Stopping.")
+            return "finish"
+            
+        print(f"⚠️ Error found: {error}. Retrying...")
+        return "retry"
 
     def chat(self, user_input: str, thread_id: str = "1"):
         config = {"configurable": {"thread_id": thread_id}}
-        print(f"\n👤 User: {user_input}")
         
-        # Start the conversation
-        current_input = user_input
-        max_tries = 3
+        # Initialize state
+        initial_state = {
+            "messages": [HumanMessage(content=user_input)],
+            "iterations": 0,
+            "error": None,
+            "code": None
+        }
         
-        for attempt in range(max_tries):
-            # 1. Ask the Brain
-            output = self.app.invoke(
-                {"messages": [HumanMessage(content=current_input)]}, 
-                config
-            )
-            
-            response_text = output["messages"][-1].content
-            
-            # 2. Check if the Brain wrote code
-            if "```python" in response_text:
-                code = response_text.split("```python")[1].split("```")[0].strip()
-                print(f"⚙️ Attempt {attempt + 1}: Running code...")
-                
-                # 3. Use the Hands to run it
-                result = self.executor.execute(code)
-                
-                if result['success'] and not result['error']:
-                    print(f"✅ Success! Output:\n{result['output']}")
-                    break # It worked! Exit the loop.
-                else:
-                    # 4. IT FAILED! Feed the error back to the Brain
-                    print(f"❌ Error found: {result['error'].strip()}")
-                    print("🔄 Sending error to Brain for fixing...")
-                    
-                    # We update the 'current_input' to be the error message
-                    current_input = f"That code gave an error: {result['error']}. Please fix the code and try again."
-            else:
-                print(f"🤖 Agent: {response_text}")
-                break
+        self.app.invoke(initial_state, config)
 
 if __name__ == "__main__":
     bot = CodeSentinel()
-    # TEST 1: Introduction
-    bot.chat("Hi, my name is Ruchir Adnaik.")
-    # TEST 2: Memory Test
-    bot.chat("What is my name?")
-    # TEST 3: Coding Test
-    bot.chat("""correct this code for me please: 
-
-""")
+    bot.chat("Write a python function to calculate fibonacci sequence up to n, but make a deliberate syntax error so I can see you fix it.")
