@@ -1,0 +1,22 @@
+Problem Statement: Auto-Fix GitHub Bot
+
+Software teams spend a lot of time manually debugging runtime errors, understanding unfamiliar codebases, and creating fixes. 
+This process is slow, repetitive, and error-prone—especially in large Python repositories with complex internal documentation.
+
+To address this problem, we propose **Auto-Fix GitHub Bot**, an automated agent that can detect runtime errors in a real Python GitHub repository and fix them without human intervention.
+
+When a runtime error occurs, the bot:
+
+1. Reads and analyzes the error logs to understand the failure.
+2. Refers to the project’s internal documentation to understand the existing code structure.
+3. Automatically generates a code fix for the issue.
+4. Executes unit tests in a safe sandbox environment to verify the fix.
+5. Creates a Pull Request on GitHub with the validated solution.
+
+This system goes beyond a traditional chatbot by actively writing, testing, and committing production-ready code. It directly reduces developer workload and demonstrates real-world automation of software maintenance tasks.
+
+**Technology Stack:**
+
+* LangGraph for building an intelligent multi-step agent
+* Docker for secure and isolated code execution
+* GitHub API for repository access and Pull Request creation
