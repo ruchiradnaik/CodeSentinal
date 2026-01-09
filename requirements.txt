@@ -1,0 +1,25 @@
+# Core Python utilities
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# GitHub integration
+PyGithub>=2.3.0
+
+# LangChain ecosystem
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+
+# LLM provider (OpenAI-compatible)
+langchain-openai>=0.1.7
+openai>=1.30.0
+
+# LangGraph (agent workflows)
+langgraph>=0.0.45
+
+# Data validation
+pydantic>=2.6.0
+
+# Async & retries (used internally by langchain/openai)
+tenacity>=8.2.3
+tqdm>=4.66.0
