@@ -1,16 +1,10 @@
-def normalize_scores(scores):
-    total = sum(scores)
-    
-    # Check if total is zero to avoid division by zero
-    if total == 0:
-        return [0] * len(scores)  # Return a list of zeros if total is zero
+# Verified by CodeSentinel
+def divide_numbers(a, b):
+    return a / b
 
-    normalized = []
-    for s in scores:
-        normalized.append(s / total)
-
-    return normalized
-
-data = [10, 20, 30, 40]
-result = normalize_scores(data)
-print(result)
+if __name__ == "__main__":
+    try:
+        result = divide_numbers(10, 0)
+        print(f"Result: {result}")
+    except ZeroDivisionError:
+        print("Error: Division by zero is not allowed.")
