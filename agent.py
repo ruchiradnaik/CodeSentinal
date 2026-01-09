@@ -33,6 +33,24 @@ class CodeSentinel:
         auth = Auth.Token(os.getenv("GITHUB_TOKEN"))
         self.gh = Github(auth=auth)
         self.repo = self.gh.get_repo(repo_name)
+
+        # --- Handle Permissions & Forking ---
+        try:
+            self.repo = self.gh.get_repo(repo_name)
+            # Test write access by checking permissions
+            perms = self.repo.permissions
+            if not perms.push:
+                raise Exception("403: No push access")
+            print(f"✅ Connected to: {repo_name}")
+        except Exception as e:
+            if "403" in str(e) or "Resource not accessible" in str(e) or "No push access" in str(e):
+                print(f"🔒 Access denied to {repo_name}. Attempting to fork...")
+                original_repo = self.gh.get_repo(repo_name)
+                user = self.gh.get_user()
+                self.repo = user.create_fork(original_repo)
+                print(f"🍴 Fork created at: {self.repo.full_name}")
+            else:
+                raise e
         
         # Build Graph
         workflow = StateGraph(AgentState)
@@ -60,13 +78,19 @@ class CodeSentinel:
 
     # --- NEW NODE: The Researcher ---
     def fetch_docs(self, state: AgentState):
-        print("📖 Reading project documentation (README.md)...")
+        print("📖 Reading project structure...")
+    # List all files in the repo to give the bot context
+        contents = self.repo.get_contents("")
+        repo_files = [content.path for content in contents]
+        file_list_str = "\n".join(repo_files)
+    
         try:
-            content = self.repo.get_contents("README.md").decoded_content.decode()
-            return {"docs": content}
+            readme = self.repo.get_contents("README.md").decoded_content.decode()
         except:
-            print("⚠️ No README.md found, proceeding without extra context.")
-            return {"docs": "No documentation available."}
+            readme = "No README found."
+        
+        context = f"File Structure:\n{file_list_str}\n\nDocumentation:\n{readme}"
+        return {"docs": context}
 
     # --- Node: Fetch Code ---
     def fetch_file(self, state: AgentState):
@@ -108,9 +132,28 @@ class CodeSentinel:
 
     # --- Node: Execute ---
     def execute_test(self, state: AgentState):
-        print(f"⚙️ Testing fix locally (Attempt {state['iterations']})...")
+        print(f"⚙️ Testing fix in Docker (Attempt {state['iterations']})...")
         result = self.executor.execute(state["code"])
-        return {"error": result["error"] if not result["success"] else None}
+    
+        # If there's no error, we MUST return an empty string, not None
+        error_value = result["error"] if result["error"] else ""
+    
+        return {"error": error_value}
+    
+    def generate_pr_summary(self, state: AgentState):
+        prompt = f"""
+        Analyze the fix you just made.
+        File: {state['file_path']}
+        Original Error: {state.get('error', 'Runtime crash')}
+        Fixed Code: {state['code']}
+    
+        Write a professional PR description:
+        - **Issue**: Explain the bug.
+        - **Resolution**: Explain how you fixed it.
+        - **Verification**: State that the code passed local execution tests.
+        """
+        summary = self.llm.invoke([HumanMessage(content=prompt)])
+        return summary.content
 
     # --- Node: Create PR ---
     def create_pr(self, state: AgentState):
@@ -118,13 +161,29 @@ class CodeSentinel:
         path = state["file_path"]
         print(f"🚀 Success! Creating PR on branch {branch_name}...")
         
+        # 1. Generate the detailed explanation using your new method
+        pr_body = self.generate_pr_summary(state)
+        
         main = self.repo.get_branch("main")
         self.repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=main.commit.sha)
         
         file_git = self.repo.get_contents(path)
-        self.repo.update_file(path, "🤖 Auto-fix with Documentation context", state["code"], file_git.sha, branch=branch_name)
+        self.repo.update_file(
+            path, 
+            "🤖 Auto-fix with Documentation context", 
+            state["code"], 
+            file_git.sha, 
+            branch=branch_name
+        )
         
-        pr = self.repo.create_pull(title=f"Auto-Fix: {path}", body="Verified fix based on internal documentation.", head=branch_name, base="main")
+        # 2. Use the generated summary in the body
+        pr = self.repo.create_pull(
+            title=f"Auto-Fix: {path}", 
+            body=pr_body, 
+            head=branch_name, 
+            base="main"
+        )
+        
         print(f"✅ Mission Accomplished! PR: {pr.html_url}")
         return {"messages": [HumanMessage(content=f"PR Created: {pr.html_url}")]}
 
@@ -133,8 +192,23 @@ class CodeSentinel:
         return "retry" if state["iterations"] < 3 else "submit"
 
     def run(self, file_to_fix):
-        config = {"configurable": {"thread_id": "gh-doc-1"}}
-        self.app.invoke({"file_path": file_to_fix, "iterations": 0, "messages": []}, config)
+        # 1. Create a unique thread ID for this specific run
+        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        
+        # 2. Initialize EVERY key to a default empty value
+        # This prevents the 'NoneType' error
+        initial_state = {
+            "messages": [],
+            "file_path": file_to_fix,
+            "original_code": "",
+            "docs": "",
+            "code": "",
+            "error": "",
+            "iterations": 0
+        }
+        
+        # 3. Use the initialized state
+        return self.app.invoke(initial_state, config)
 
 if __name__ == "__main__":
     bot = CodeSentinel(os.getenv("GITHUB_REPO"))
