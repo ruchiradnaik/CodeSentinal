@@ -7,21 +7,25 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, BaseMessage
 from langgraph.graph import START, END, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
-
+import re
 from executor import PythonExecutor 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+def update_last(old, new):
+    return new
+
 # --- 1. Define State ---
 class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], operator.add]
-    file_path: str
-    original_code: str
-    docs: str             # <--- New: Stores project context
-    code: str
-    error: str
-    iterations: int
+    file_path: Annotated[str, update_last]
+    original_code: Annotated[str, update_last]
+    docs: Annotated[str, update_last]
+    extra_context: Annotated[str, update_last] # <--- NEW: Stores extra file contents
+    code: Annotated[str, update_last]
+    error: Annotated[str, update_last]
+    iterations: Annotated[int, update_last]
 
 class CodeSentinel:
     def __init__(self, repo_name):
@@ -59,6 +63,7 @@ class CodeSentinel:
         workflow.add_node("fetch_docs", self.fetch_docs) # <--- New Node
         workflow.add_node("fetch_file", self.fetch_file)
         workflow.add_node("generate_fix", self.generate_fix)
+        workflow.add_node("fetch_extra", self.fetch_extra_context)
         workflow.add_node("execute_test", self.execute_test)
         workflow.add_node("create_pr", self.create_pr)
 
@@ -67,6 +72,16 @@ class CodeSentinel:
         workflow.add_edge("fetch_docs", "fetch_file")
         workflow.add_edge("fetch_file", "generate_fix")
         workflow.add_edge("generate_fix", "execute_test")
+
+        # MULTI-FILE ROUTING: Test the code or go get more files?
+        workflow.add_conditional_edges(
+            "generate_fix",
+            self.decide_research_or_test,
+            {"research": "fetch_extra", "test": "execute_test"}
+        )
+        
+        # Loop back after getting extra info
+        workflow.add_edge("fetch_extra", "generate_fix")
         
         workflow.add_conditional_edges(
             "execute_test",
@@ -98,9 +113,27 @@ class CodeSentinel:
         print(f"📂 Fetching {path} from GitHub...")
         content = self.repo.get_contents(path).decoded_content.decode()
         return {"original_code": content}
-
+    
+    # --- Node: Fetch Extra Context (The Multi-File Key) ---
+    def fetch_extra_context(self, state: AgentState):
+        last_msg = state["messages"][-1].content
+        match = re.search(r"FETCH_FILE:\s*(\S+)", last_msg)
+        
+        if match:
+            extra_path = match.group(1)
+            print(f"🧐 Agent needs to see: {extra_path}")
+            try:
+                content = self.repo.get_contents(extra_path).decoded_content.decode()
+                new_context = state.get("extra_context", "") + f"\n\n--- Content of {extra_path} ---\n{content}"
+                return {"extra_context": new_context, "messages": [HumanMessage(content=f"Fetched {extra_path}")]}
+            except:
+                return {"messages": [HumanMessage(content=f"Error: {extra_path} not found.")]}
+        return {}
+        
     # --- Node: Generate (Modified to use Docs) ---
     def generate_fix(self, state: AgentState):
+        signature = "\n\n# CodeSentinal: created for you by RuchirAdnaik."
+
         # We now pass the documentation into the prompt
         prompt = f"""
         PROJECT DOCUMENTATION:
@@ -114,6 +147,8 @@ class CodeSentinel:
         2. Fix the error.
         3. Ensure your fix follows any coding standards or rules mentioned in the PROJECT DOCUMENTATION above.
         4. Return ONLY the full corrected python code in a markdown block.
+        5. MANDATORY: You must add the following comment as the very last line of the code:
+           # CodeSentinal: created for you by RuchirAdnaik.
         """
         
         if state.get("error"):
@@ -127,6 +162,8 @@ class CodeSentinel:
             code = content.split("```python")[1].split("```")[0].strip()
         else:
             code = content.strip()
+        if "CodeSentinal: created for you by RuchirAdnaik." not in code:
+            code += signature
             
         return {"messages": [response], "code": code, "iterations": state.get("iterations", 0) + 1}
 
@@ -139,6 +176,17 @@ class CodeSentinel:
         error_value = result["error"] if result["error"] else ""
     
         return {"error": error_value}
+    
+    # --- Router: Research vs Test ---
+    def decide_research_or_test(self, state: AgentState):
+        if "FETCH_FILE:" in state["messages"][-1].content:
+            return "research"
+        return "test"
+    
+    # --- Router: Retry vs Submit ---
+    def decide_next(self, state: AgentState):
+        if not state.get("error"): return "submit"
+        return "retry" if state["iterations"] < 3 else "submit"
     
     def generate_pr_summary(self, state: AgentState):
         prompt = f"""
@@ -159,33 +207,53 @@ class CodeSentinel:
     def create_pr(self, state: AgentState):
         branch_name = f"fix-{uuid.uuid4().hex[:6]}"
         path = state["file_path"]
-        print(f"🚀 Success! Creating PR on branch {branch_name}...")
-        
-        # 1. Generate the detailed explanation using your new method
         pr_body = self.generate_pr_summary(state)
         
-        main = self.repo.get_branch("main")
-        self.repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=main.commit.sha)
+        # Check if this is a fork or our own repo
+        is_fork = self.repo.fork 
         
+        # 1. Create the fix branch
+        main_ref = self.repo.get_branch(self.repo.default_branch)
+        self.repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=main_ref.commit.sha)
+        
+        # 2. Update the file on that branch
         file_git = self.repo.get_contents(path)
         self.repo.update_file(
             path, 
-            "🤖 Auto-fix with Documentation context", 
+            "🤖 CodeSentinal Auto-fix", 
             state["code"], 
             file_git.sha, 
             branch=branch_name
         )
         
-        # 2. Use the generated summary in the body
-        pr = self.repo.create_pull(
-            title=f"Auto-Fix: {path}", 
-            body=pr_body, 
-            head=branch_name, 
-            base="main"
-        )
+        if is_fork:
+            print("🍴 This is a fork. Auto-merging fix into the fork's main branch...")
+            # AUTO-MERGE into the fork's default branch
+            self.repo.merge(self.repo.default_branch, branch_name, "Auto-merging verified fix")
+            
+            # Optional: Still create a PR to the ORIGINAL owner so they see your work
+            parent_repo = self.repo.parent # This is the original repo you forked from
+            try:
+                pr = parent_repo.create_pull(
+                    title=f"Fix for {path}",
+                    body=f"Sent with ❤️ from CodeSentinal.\n\n{pr_body}",
+                    head=f"{self.gh.get_user().login}:{branch_name}",
+                    base=parent_repo.default_branch
+                )
+                msg = f"Fix merged into your fork and PR sent to original owner: {pr.html_url}"
+            except:
+                msg = "Fix merged into your fork. (Original owner doesn't allow PRs)"
+        else:
+            print("👤 You own this repo. Creating a PR for your review...")
+            pr = self.repo.create_pull(
+                title=f"Proposed Fix: {path}",
+                body=pr_body,
+                head=branch_name,
+                base=self.repo.default_branch
+            )
+            msg = f"PR Created for your review: {pr.html_url}"
         
-        print(f"✅ Mission Accomplished! PR: {pr.html_url}")
-        return {"messages": [HumanMessage(content=f"PR Created: {pr.html_url}")]}
+        return {"messages": [HumanMessage(content=msg)]}
 
     def decide_next(self, state: AgentState):
         if not state.get("error"): return "submit"
@@ -209,7 +277,4 @@ class CodeSentinel:
         
         # 3. Use the initialized state
         return self.app.invoke(initial_state, config)
-
-if __name__ == "__main__":
-    bot = CodeSentinel(os.getenv("GITHUB_REPO"))
-    bot.run("calculator.py")
+    
