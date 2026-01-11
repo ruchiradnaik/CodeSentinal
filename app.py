@@ -24,20 +24,21 @@ with st.sidebar:
     st.header("📍 Project Context")
     # Users can either type it here or the bot will extract it from chat
     repo_input = st.text_input("GitHub Repository", value=os.getenv("GITHUB_REPO", ""), placeholder="user/repo")
-    file_input = st.text_input("Target File", placeholder="e.g., app.py")
     
     st.divider()
     st.markdown("### How it works")
     st.info("""
-    1. Chat with the bot about your bug.
-    2. Provide the Repo and File name.
-    3. Watch the agent research, test in Docker, and create a PR!
+    1. Provide the GitHub Repository (user/repo).
+    2. The agent will scan all Python files.
+    3. Test each file and identify failures.
+    4. Fix all failing files automatically.
+    5. Create a PR with all fixes!
     """)
 
 # --- Chat Session State ---
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hi there! I'm CodeSentinel. Facing a bug? Tell me about the issue, or just share your GitHub repo and the file name you want me to fix."}
+        {"role": "assistant", "content": "Hi there! I'm CodeSentinel. Just provide your GitHub repository (user/repo) and I'll scan all files, test them, fix any failures, and create a PR!"}
     ]
 
 # Display chat history
@@ -56,67 +57,87 @@ if user_query := st.chat_input("Explain your error or share repo details..."):
         # Check if we have the required info to start the "Auto-Fix"
         # We check both sidebar and user input
         repo = repo_input if repo_input else ""
-        file_to_fix = file_input if file_input else ""
         
-        # If we have both, start the engine!
-        if "/" in repo and "." in file_to_fix:
+        # Extract repo from user query if not in sidebar
+        if not repo and "/" in user_query:
+            # Try to extract repo from user query
+            parts = user_query.split()
+            for part in parts:
+                if "/" in part and len(part.split("/")) == 2:
+                    repo = part
+                    break
+        
+        # If we have repo, start the engine!
+        if "/" in repo:
             with st.status("🛠️ CodeSentinel Engine Starting...", expanded=True) as status:
                 try:
                     # Initialize Agent
                     bot = CodeSentinel(repo)
                     
                     st.write("🔍 **Step 1:** Researching repo structure and README...")
-                    # bot.run internally handles the LangGraph flow
                     
-                    st.write(f"📂 **Step 2:** Fetching `{file_to_fix}` from GitHub...")
+                    st.write("📋 **Step 2:** Scanning repository for all Python files...")
                     
-                    st.write("🧪 **Step 3:** Analyzing code and running tests in Docker sandbox...")
+                    st.write("🧪 **Step 3:** Testing all files to identify failures...")
                     
-                    # RUN THE AGENT
-                    # We store the result to extract codes and PR link
-                    final_state = bot.run(file_to_fix)
+                    # RUN THE AGENT (no file_to_fix needed - it will scan all files)
+                    final_state = bot.run()
                     
-                    st.write("🚀 **Step 4:** Success! Creating Pull Request and Explanation...")
+                    st.write("🔧 **Step 4:** Fixing all failing files...")
+                    
+                    st.write("🚀 **Step 5:** Creating Pull Request with all fixes...")
                     
                     status.update(label="✅ Mission Accomplished!", state="complete", expanded=False)
                     
                     # --- SUCCESS UI ---
                     # 1. Explanation from the bot
-                    explanation = final_state.get("messages", [])[-1].content
-                    st.markdown(f"### 🧠 Bot's Analysis & Fix\n{explanation}")
+                    explanation = final_state.get("messages", [])[-1].content if final_state.get("messages") else "Process completed!"
+                    st.markdown(f"### 🧠 Bot's Summary\n{explanation}")
                     
-                    # 2. Side-by-Side Diff Viewer
+                    # 2. Show fixed files
+                    fixed_files = final_state.get("fixed_files", {})
+                    failing_files = final_state.get("failing_files", [])
+                    all_files = final_state.get("all_files", [])
+                    
                     st.divider()
-                    st.subheader("📊 Code Comparison")
-                    old_code = final_state.get("original_code", "")
-                    new_code = final_state.get("code", "")
+                    st.subheader("📊 Processing Summary")
                     
-                    col1, col2 = st.columns(2)
+                    col1, col2, col3 = st.columns(3)
                     with col1:
-                        st.caption("Original (Broken)")
-                        st.code(old_code, language="python")
+                        st.metric("Total Files", len(all_files))
                     with col2:
-                        st.caption("Fixed (Verified)")
-                        st.code(new_code, language="python")
+                        st.metric("Files Tested", len(all_files))
+                    with col3:
+                        st.metric("Files Fixed", len(fixed_files))
+                    
+                    if fixed_files:
+                        st.subheader("📝 Fixed Files")
+                        for file_path in fixed_files.keys():
+                            st.success(f"✅ {file_path}")
+                    
+                    if failing_files and len(fixed_files) < len(failing_files):
+                        st.warning(f"⚠️ Some files couldn't be fixed after max retries: {len(failing_files) - len(fixed_files)}")
 
                     # 3. Final Call to Action
                     # Find PR link in messages
                     pr_link = "Check your GitHub repository!"
                     for msg in reversed(final_state.get("messages", [])):
-                        if "PR Created:" in msg.content:
+                        if "PR Created" in msg.content or "PR sent" in msg.content or "html_url" in str(msg.content):
                             pr_link = msg.content
                             break
                             
                     st.balloons()
                     st.success(f"**{pr_link}**")
-                    st.session_state.messages.append({"role": "assistant", "content": f"I've fixed `{file_to_fix}`! {pr_link}"})
+                    st.session_state.messages.append({"role": "assistant", "content": f"I've processed {len(all_files)} file(s) and fixed {len(fixed_files)} file(s)! {pr_link}"})
 
                 except Exception as e:
                     status.update(label="❌ Process Failed", state="error")
                     st.error(f"Error: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc())
         
         else:
             # Normal ChatGPT-style conversation if info is missing
-            response = "I'm ready to help! Please make sure you've entered the **GitHub Repo** (user/repo) and the **File Name** in the sidebar so I can start the auto-fix process."
+            response = "I'm ready to help! Please provide your **GitHub Repository** (user/repo) in the sidebar or in your message, and I'll scan all files, test them, fix any failures, and create a PR!"
             st.markdown(response)
             st.session_state.messages.append({"role": "assistant", "content": response})
