@@ -3,6 +3,7 @@ import operator
 import uuid
 from typing import Annotated, TypedDict
 from github import Github, Auth
+from github.GithubException import UnknownObjectException
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, BaseMessage
 from langgraph.graph import START, END, StateGraph
@@ -62,11 +63,35 @@ class CodeSentinel:
             print(f"✅ Connected to: {repo_name}")
         except Exception as e:
             if "403" in str(e) or "Resource not accessible" in str(e) or "No push access" in str(e):
-                print(f"🔒 Access denied to {repo_name}. Attempting to fork...")
+                print(f"🔒 Access denied to {repo_name}. Using fork with upstream sync...")
                 original_repo = self.gh.get_repo(repo_name)
                 user = self.gh.get_user()
-                self.repo = user.create_fork(original_repo)
-                print(f"🍴 Fork created at: {self.repo.full_name}")
+
+                # Try to reuse an existing fork if it already exists for this user
+                fork_full_name = f"{user.login}/{original_repo.name}"
+                fork_repo = None
+                try:
+                    fork_repo = self.gh.get_repo(fork_full_name)
+                    print(f"🍴 Existing fork found at: {fork_repo.full_name}")
+                except UnknownObjectException:
+                    # No existing fork; create a new one
+                    print("🍴 No existing fork found. Creating a new fork...")
+                    fork_repo = user.create_fork(original_repo)
+                    print(f"🍴 Fork created at: {fork_repo.full_name}")
+
+                # Sync the fork's default branch with the latest upstream commit
+                try:
+                    upstream_default = original_repo.default_branch
+                    fork_default = fork_repo.default_branch
+                    upstream_branch = original_repo.get_branch(upstream_default)
+                    fork_ref = fork_repo.get_git_ref(f"heads/{fork_default}")
+                    fork_ref.edit(sha=upstream_branch.commit.sha, force=True)
+                    print(f"🔄 Synced fork '{fork_repo.full_name}' ({fork_default}) with upstream '{original_repo.full_name}' ({upstream_default})")
+                except Exception as sync_err:
+                    # If sync fails, still proceed with the fork but log it clearly
+                    print(f"⚠️ Failed to fully sync fork with upstream: {sync_err}")
+
+                self.repo = fork_repo
             else:
                 raise e
         
