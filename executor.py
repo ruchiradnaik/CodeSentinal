@@ -3,6 +3,7 @@ import subprocess
 import sys
 import os
 import tempfile
+import re
 
 class PythonExecutor:
     def __init__(self):
@@ -32,11 +33,23 @@ class PythonExecutor:
             tmp.write(code_string)
             tmp_path = tmp.name  # This will be something like /tmp/tmp_xyz.py
 
+        # Try to infer required third-party modules from the code and install them
+        # inside the ephemeral container before execution. This avoids treating
+        # missing libraries (e.g., pandas, numpy, cv2) as code bugs.
+        inferred_modules = self._extract_imports(code_string)
+        install_cmd = ""
+        if inferred_modules:
+            # Use `pip` inside the container; installation will be local to the
+            # container filesystem and discarded once the container is removed.
+            # We keep it quiet to reduce log noise.
+            joined = " ".join(sorted(inferred_modules))
+            install_cmd = f"pip install -q {joined} && "
+
         try:
             # Docker usually has full access to /tmp or /private/tmp on Mac
             container = self.client.containers.run(
                 image="codesentinel-sandbox",
-                command=["python", "/app/script.py"],
+                command=["/bin/sh", "-c", f"{install_cmd}python /app/script.py"],
                 volumes={tmp_path: {'bind': '/app/script.py', 'mode': 'ro'}},
                 remove=True,
                 stdout=True,
@@ -53,6 +66,46 @@ class PythonExecutor:
             # Cleanup the temp file
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def _extract_imports(self, code_string: str) -> set[str]:
+        """
+        Very lightweight import parser that looks for top-level `import x` and
+        `from x import y` statements and returns the root module names. This is
+        intentionally simple and conservative; it's fine if it misses some
+        modules, but it should avoid obviously-invalid names.
+        """
+        modules: set[str] = set()
+
+        # Regexes for `import x` and `from x import y`
+        import_re = re.compile(r"^\s*import\s+([a-zA-Z0-9_.,\s]+)")
+        from_re = re.compile(r"^\s*from\s+([a-zA-Z0-9_\.]+)\s+import\s+")
+
+        for line in code_string.splitlines():
+            # Skip comments and empty lines early
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            m_import = import_re.match(line)
+            if m_import:
+                names_part = m_import.group(1)
+                # Handle cases like: import numpy as np, pandas as pd
+                for chunk in names_part.split(","):
+                    base = chunk.strip().split()[0]  # drop "as alias"
+                    if base and not base.startswith("."):
+                        modules.add(base.split(".")[0])
+                continue
+
+            m_from = from_re.match(line)
+            if m_from:
+                pkg = m_from.group(1)
+                if pkg and not pkg.startswith("."):
+                    modules.add(pkg.split(".")[0])
+
+        # We could optionally filter out a small known subset of stdlib modules
+        # to reduce unnecessary installs, but it's generally harmless if pip
+        # is asked to install an already-available module.
+        return modules
 
     def execute_local(self, code_string: str) -> dict:
         """Execute code locally using subprocess"""

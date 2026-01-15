@@ -3,8 +3,17 @@ import os
 import difflib
 from agent import CodeSentinel
 from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
 
 load_dotenv()
+
+# --- LLM for Coding Chat ---
+api_key = os.getenv("OPEN_API_KEY") or os.getenv("OPENAI_API_KEY")
+coding_llm = None
+if api_key:
+    # Dedicated model for interactive coding Q&A
+    coding_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=str(api_key))
 
 # --- Page Config ---
 st.set_page_config(page_title="CodeSentinel AI", page_icon="🤖", layout="wide")
@@ -137,7 +146,34 @@ if user_query := st.chat_input("Explain your error or share repo details..."):
                     st.code(traceback.format_exc())
         
         else:
-            # Normal ChatGPT-style conversation if info is missing
-            response = "I'm ready to help! Please provide your **GitHub Repository** (user/repo) in the sidebar or in your message, and I'll scan all files, test them, fix any failures, and create a PR!"
-            st.markdown(response)
-            st.session_state.messages.append({"role": "assistant", "content": response})
+            # --- Coding-focused chat assistant mode (no / invalid repo provided) ---
+            if coding_llm is None:
+                response = (
+                    "Coding assistant mode is unavailable because no OpenAI API key was found. "
+                    "Please set `OPEN_API_KEY` or `OPENAI_API_KEY` in your environment."
+                )
+                st.markdown(response)
+                st.session_state.messages.append({"role": "assistant", "content": response})
+            else:
+                # System prompt to constrain the assistant to coding-related topics only.
+                system_msg = SystemMessage(
+                    content=(
+                        "You are a senior software engineer assistant. "
+                        "Only answer questions related to programming, software engineering, "
+                        "APIs, tooling, debugging, or related technical topics. "
+                        "If the user asks about something non-technical, politely steer the "
+                        "conversation back to coding.\n\n"
+                        "When the user asks for code, provide clear, well-structured code examples. "
+                        "All answers must be suitable for display in a chat interface."
+                    )
+                )
+
+                user_msg = HumanMessage(content=user_query)
+                try:
+                    llm_response = coding_llm.invoke([system_msg, user_msg])
+                    answer = llm_response.content
+                except Exception as e:
+                    answer = f"Sorry, I ran into an error while answering your question: {str(e)}"
+
+                st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
