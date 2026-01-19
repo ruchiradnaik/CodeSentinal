@@ -6,18 +6,75 @@ import tempfile
 import re
 
 class PythonExecutor:
-    def __init__(self):
+    def __init__(self, dependencies: set = None):
         self.use_docker = False
         self.client = None
+        self.dependencies = dependencies or set()
+        self.local_modules: set[str] = set()
         try:
             self.client = docker.from_env()
             self.client.ping() # Check if Docker is actually running
             print("🐳 Docker is active. Building sandbox...")
-            self.client.images.build(path=".", tag="codesentinel-sandbox")
+            # Build image with dependencies if provided
+            self._build_docker_image()
             self.use_docker = True
         except Exception as e:
             print(f"⚠️ Docker Engine is stopped or unavailable ({str(e)[:50]}). Falling back to Local Execution.")
             self.client = None
+    
+    def _build_docker_image(self):
+        """Build Docker image with dependencies pre-installed"""
+        if self.dependencies:
+            # Create Dockerfile content with dependencies
+            deps_list = " ".join(sorted(self.dependencies))
+            dockerfile_content = f"""FROM python:3.9-slim
+
+# Install dependencies
+RUN pip install --no-cache-dir {deps_list}
+
+# Create a non-privileged user
+RUN useradd -m botuser
+
+# Set working directory
+WORKDIR /home/botuser/app
+
+# Switch to non-privileged user
+USER botuser
+"""
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.dockerfile', delete=False) as df:
+                df.write(dockerfile_content)
+                dockerfile_path = df.name
+            
+            try:
+                self.client.images.build(
+                    path=".",
+                    dockerfile=dockerfile_path,
+                    tag="codesentinel-sandbox",
+                    rm=True
+                )
+                print(f"✅ Docker image built with {len(self.dependencies)} dependencies pre-installed")
+            except Exception as e:
+                print(f"⚠️ Error building Docker image: {e}")
+                # Fallback to standard image (still allows runtime installs)
+                self.client.images.build(path=".", tag="codesentinel-sandbox")
+            finally:
+                if os.path.exists(dockerfile_path):
+                    os.remove(dockerfile_path)
+        else:
+            # Build standard image
+            self.client.images.build(path=".", tag="codesentinel-sandbox")
+
+    def set_dependencies(self, dependencies: set):
+        """Update dependencies and rebuild image if needed"""
+        if dependencies != self.dependencies:
+            self.dependencies = dependencies
+            if self.use_docker and self.client:
+                print("🔄 Rebuilding Docker image with new dependencies...")
+                self._build_docker_image()
+
+    def set_local_modules(self, local_modules: set):
+        """Provide local module names so we never try to pip-install them."""
+        self.local_modules = local_modules or set()
 
     def execute(self, code_string: str) -> dict:
         # Use Docker if available, otherwise fall back to local execution
@@ -33,39 +90,88 @@ class PythonExecutor:
             tmp.write(code_string)
             tmp_path = tmp.name  # This will be something like /tmp/tmp_xyz.py
 
-        # Try to infer required third-party modules from the code and install them
-        # inside the ephemeral container before execution. This avoids treating
-        # missing libraries (e.g., pandas, numpy, cv2) as code bugs.
+        # Dependencies should already be pre-installed in the image
+        # Only install missing ones at runtime if needed (with network access)
         inferred_modules = self._extract_imports(code_string)
+        # Never try to install local project modules as pip packages
+        inferred_modules = {m for m in inferred_modules if m not in self.local_modules}
+        missing_modules = inferred_modules - self.dependencies
+        
         install_cmd = ""
-        if inferred_modules:
-            # Use `pip` inside the container; installation will be local to the
-            # container filesystem and discarded once the container is removed.
-            # We keep it quiet to reduce log noise.
-            joined = " ".join(sorted(inferred_modules))
+        if missing_modules:
+            # Normalize common aliases at runtime just in case (defensive)
+            alias_map = {"cv2": "opencv-python", "PIL": "Pillow", "sklearn": "scikit-learn", "yaml": "PyYAML", "dateutil": "python-dateutil", "dotenv": "python-dotenv"}
+            normalized = {alias_map.get(m, m) for m in missing_modules}
+            joined = " ".join(sorted(normalized))
             install_cmd = f"pip install -q {joined} && "
 
         try:
-            # Docker usually has full access to /tmp or /private/tmp on Mac
-            container = self.client.containers.run(
-                image="codesentinel-sandbox",
-                command=["/bin/sh", "-c", f"{install_cmd}python /app/script.py"],
-                volumes={tmp_path: {'bind': '/app/script.py', 'mode': 'ro'}},
-                remove=True,
-                stdout=True,
-                stderr=True,
-                network_disabled=True
-            )
-            return {"success": True, "output": container.decode('utf-8'), "error": ""}
+            logs = self.client.containers.run(
+            image="codesentinel-sandbox",
+            command=[
+            "/bin/sh", "-c",
+            f"""
+            set -e
+            {install_cmd}
+            python /app/script.py
+            """
+            ],
+            volumes={tmp_path: {'bind': '/app/script.py', 'mode': 'ro'}},
+            remove=True,
+            stdout=True,
+            stderr=True,
+            network_disabled=False
+        )
+
+            output = logs.decode("utf-8")
+
+            # Real Python failure
+            if "Traceback (most recent call last):" in output or "SyntaxError" in output:
+                return {"success": False, "output": "", "error": output}
+
+            # Otherwise success (warnings, pip notices are fine)
+            return {"success": True, "output": output, "error": ""}
+
         except docker.errors.ContainerError as e:
-            error_msg = e.stderr.decode('utf-8') if hasattr(e, 'stderr') and e.stderr else str(e)
-            return {"success": False, "output": "", "error": error_msg}
-        except Exception as e:
-            return {"success": False, "output": "", "error": str(e)}
+            err = e.stderr.decode("utf-8") if e.stderr else str(e)
+
+        # Dependency / pip failure
+            if "pip install" in err or "Could not find a version" in err:
+                return {
+            "success": False,
+            "output": "",
+            "error": f"Dependency installation failed:\n{err}"
+        }
+
+    # Python runtime failure
+            if "Traceback (most recent call last):" in err or "SyntaxError" in err:
+                return {
+            "success": False,
+            "output": "",
+            "error": f"Runtime error:\n{err}"
+        }
+
+    # Fallback: container-level failure
+            return {
+        "success": False,
+        "output": "",
+        "error": err
+        }
+
         finally:
-            # Cleanup the temp file
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    
+    def _is_only_pip_noise(self, text: str) -> bool:
+        pip_noise_patterns = [
+            "A new release of pip is available",
+            "You should consider upgrading",
+            "WARNING: Retrying",
+        ]
+        return all(any(p in line for p in pip_noise_patterns)
+               for line in text.splitlines() if line.strip())
+
 
     def _extract_imports(self, code_string: str) -> set[str]:
         """
@@ -102,10 +208,17 @@ class PythonExecutor:
                 if pkg and not pkg.startswith("."):
                     modules.add(pkg.split(".")[0])
 
-        # We could optionally filter out a small known subset of stdlib modules
-        # to reduce unnecessary installs, but it's generally harmless if pip
-        # is asked to install an already-available module.
+        # 🔽 ADD THIS BLOCK RIGHT HERE 🔽
+        stdlib_like = {
+            "sys", "os", "re", "json", "time", "math", "hashlib",
+            "subprocess", "typing", "pathlib"
+        }
+
+        modules = {m for m in modules if m not in stdlib_like}
+        # 🔼 END ADDITION 🔼
+
         return modules
+
 
     def execute_local(self, code_string: str) -> dict:
         """Execute code locally using subprocess"""
