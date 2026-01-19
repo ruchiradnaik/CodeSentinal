@@ -23,3 +23,7 @@ pydantic>=2.6.0
 # Async & retries (used internally by langchain/openai)
 tenacity>=8.2.3
 tqdm>=4.66.0
+
+# Codebase indexing and embeddings
+numpy>=1.24.0
+faiss-cpu>=1.7.4  # Efficient similarity search (use faiss-gpu for GPU support)

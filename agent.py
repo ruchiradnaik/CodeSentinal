@@ -1,6 +1,7 @@
 import os
 import operator
 import uuid
+import difflib
 from typing import Annotated, TypedDict
 from github import Github, Auth
 from github.GithubException import UnknownObjectException
@@ -10,6 +11,8 @@ from langgraph.graph import START, END, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
 import re
 from executor import PythonExecutor 
+from codebase_indexer import CodebaseIndexer
+from dependency_detector import DependencyDetector
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,6 +37,10 @@ class AgentState(TypedDict):
     original_codes: Annotated[dict[str, str], update_last]  # Dict mapping file_path -> original_code
     file_errors: Annotated[dict[str, str], update_last]  # Dict mapping file_path -> error_message
     current_file_index: Annotated[int, update_last]  # Index of current file being processed
+    # Codebase understanding
+    codebase_index: Annotated[dict, update_last]  # Codebase indexer instance (stored as dict for state)
+    related_context: Annotated[str, update_last]  # Related file context for current file
+    research_iterations: Annotated[int, update_last]  # Counter to prevent infinite research loops
 
 class CodeSentinel:
     def __init__(self, repo_name):
@@ -45,8 +52,12 @@ class CodeSentinel:
         if callable(api_key):
             api_key = api_key()
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=str(api_key))
-        self.executor = PythonExecutor()
+        self.executor = PythonExecutor()  # Will be updated with dependencies later
         self.memory = MemorySaver()
+        # Initialize codebase indexer (will be populated during indexing)
+        self.indexer = None
+        # Initialize dependency detector
+        self.dependency_detector = DependencyDetector()
         
         # Fixed the DeprecationWarning you saw
         auth = Auth.Token(os.getenv("GITHUB_TOKEN"))
@@ -101,8 +112,11 @@ class CodeSentinel:
         # Define Nodes
         workflow.add_node("fetch_docs", self.fetch_docs)
         workflow.add_node("scan_files", self.scan_files)  # NEW: Scan all Python files
+        workflow.add_node("detect_dependencies", self.detect_dependencies)  # NEW: Detect dependencies
+        workflow.add_node("index_codebase", self.index_codebase)  # NEW: Index codebase with embeddings
         workflow.add_node("test_all_files", self.test_all_files)  # NEW: Test all files
         workflow.add_node("fetch_file", self.fetch_file)
+        workflow.add_node("analyze_impact", self.analyze_impact)  # NEW: Analyze impact before fixing
         workflow.add_node("generate_fix", self.generate_fix)
         workflow.add_node("fetch_extra", self.fetch_extra_context)
         workflow.add_node("execute_test", self.execute_test)
@@ -111,7 +125,9 @@ class CodeSentinel:
         # Connect Nodes - Multi-file flow
         workflow.add_edge(START, "fetch_docs")
         workflow.add_edge("fetch_docs", "scan_files")
-        workflow.add_edge("scan_files", "test_all_files")
+        workflow.add_edge("scan_files", "detect_dependencies")  # Detect dependencies first
+        workflow.add_edge("detect_dependencies", "index_codebase")  # Index after detecting deps
+        workflow.add_edge("index_codebase", "test_all_files")  # Test after indexing
         
         # After testing, check if there are failing files
         workflow.add_conditional_edges(
@@ -121,13 +137,18 @@ class CodeSentinel:
         )
         
         # Single file fix flow (for each failing file)
-        workflow.add_edge("fetch_file", "generate_fix")
+        workflow.add_edge("fetch_file", "analyze_impact")  # Analyze impact first
+        workflow.add_edge("analyze_impact", "generate_fix")  # Then generate fix with context
         workflow.add_conditional_edges(
             "generate_fix",
             self.decide_research_or_test,
             {"research": "fetch_extra", "test": "execute_test"}
         )
-        workflow.add_edge("fetch_extra", "generate_fix")
+        workflow.add_conditional_edges(
+            "fetch_extra",
+            self.decide_after_research,
+            {"continue_research": "generate_fix", "test": "execute_test"}
+        )
         
         workflow.add_conditional_edges(
             "execute_test",
@@ -192,7 +213,97 @@ class CodeSentinel:
             "fixed_files": {},
             "original_codes": {},
             "file_errors": {},
-            "current_file_index": 0
+            "current_file_index": 0,
+            "codebase_index": {},
+            "related_context": ""
+        }
+    
+    # --- NEW NODE: Index codebase with embeddings ---
+    def index_codebase(self, state: AgentState):
+        print("📚 Indexing codebase for semantic understanding...")
+        all_files = state.get("all_files", [])
+        
+        if not all_files:
+            print("⚠️ No files to index")
+            return {"codebase_index": {}}
+        
+        try:
+            # Initialize indexer if not already done
+            if self.indexer is None:
+                self.indexer = CodebaseIndexer(self.repo)
+            
+            # Index all files
+            index_info = self.indexer.index_codebase(all_files)
+            print(f"✅ Codebase indexed: {index_info['indexed_files']} files")
+            print(f"   Dependencies mapped: {len(index_info.get('dependencies', {}))} files have dependencies")
+            
+            return {"codebase_index": {"indexed": True, "file_count": index_info['indexed_files']}}
+        except Exception as e:
+            print(f"⚠️ Error indexing codebase: {e}")
+            # Continue without indexing if it fails
+            return {"codebase_index": {"indexed": False, "error": str(e)}}
+    
+    # --- NEW NODE: Detect dependencies from codebase ---
+    def detect_dependencies(self, state: AgentState):
+        """Detect all dependencies from the codebase"""
+        print("📦 Detecting dependencies from codebase...")
+        all_files = state.get("all_files", [])
+        
+        if not all_files:
+            return {}
+        
+        # Check if repo has requirements.txt
+        repo_requirements = set()
+        try:
+            reqs_file = self.repo.get_contents("requirements.txt")
+            reqs_content = reqs_file.decoded_content.decode()
+            # Parse requirements.txt
+            for line in reqs_content.splitlines():
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # Extract package name (before ==, >=, etc.)
+                    pkg_name = re.split(r'[>=<!=]', line)[0].strip()
+                    if pkg_name:
+                        repo_requirements.add(pkg_name)
+            print(f"📋 Found requirements.txt with {len(repo_requirements)} packages")
+        except Exception:
+            print("📋 No requirements.txt found in repo")
+        
+        # Scan codebase for imports
+        detected_imports = self.dependency_detector.scan_codebase(self.repo, all_files)
+
+        # Convert import names -> pip package names (cv2 -> opencv-python, etc.)
+        detected_pkgs_txt = self.dependency_detector.generate_requirements_txt(detected_imports)
+        detected_packages = {
+            line.strip()
+            for line in detected_pkgs_txt.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        
+        # Combine repo requirements with detected dependencies
+        # Map repo requirements through the same import→pip mapping to normalize (e.g., cv2->opencv-python)
+        repo_req_txt = self.dependency_detector.generate_requirements_txt(repo_requirements)
+        repo_pkgs = {
+            line.strip()
+            for line in repo_req_txt.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+
+        all_dependencies = repo_pkgs.union(detected_packages)
+        
+        # Update executor with dependencies
+        self.executor.set_dependencies(all_dependencies)
+        # Also set local modules so runtime pip never tries to install them
+        self.executor.set_local_modules(self.dependency_detector.local_modules)
+        
+        print(f"✅ Total dependencies: {len(all_dependencies)}")
+        if all_dependencies:
+            deps_list = sorted(all_dependencies)
+            print(f"   Packages: {', '.join(deps_list[:10])}{'...' if len(deps_list) > 10 else ''}")
+        
+        return {
+            "dependencies": list(all_dependencies),
+            "local_modules": list(self.dependency_detector.local_modules),
         }
     
     # --- NEW NODE: Test all files and identify failures ---
@@ -265,11 +376,16 @@ class CodeSentinel:
         fixed_files = state.get("fixed_files", {})
         current_file = state.get("file_path", "")
         
-        # Save the fixed code for current file (if code exists and no error, or if we're moving on after max retries)
+        # Save the fixed code for current file ONLY if it actually changed
         code = state.get("code", "")
         if code and current_file:
-            fixed_files[current_file] = code
-            print(f"💾 Saved fix for {current_file}")
+            original_codes = state.get("original_codes", {})
+            original = original_codes.get(current_file, state.get("original_code", ""))
+            if original.strip() != code.strip():
+                fixed_files[current_file] = code
+                print(f"💾 Saved fix for {current_file}")
+            else:
+                print(f"⏭️  No changes for {current_file}; skipping save")
         
         # Move to next file
         if current_index + 1 < len(failing_files):
@@ -281,7 +397,8 @@ class CodeSentinel:
                 "current_file_index": current_index + 1,
                 "iterations": 0,
                 "error": "",
-                "code": ""  # Reset code for next file
+                "code": "",  # Reset code for next file
+                "research_iterations": 0  # Reset research counter for next file
             }
         else:
             # All files processed
@@ -304,48 +421,110 @@ class CodeSentinel:
         
         print(f"📂 Fetching {path} from GitHub...")
         content = self.repo.get_contents(path).decoded_content.decode()
+        
+        # Get related context from codebase indexer
+        related_context = ""
+        if self.indexer:
+            try:
+                related_context = self.indexer.get_context_for_file(path, max_files=5)
+                if related_context:
+                    print(f"🔗 Found {len(related_context.split('---')) - 1} related file(s) for context")
+            except Exception as e:
+                print(f"⚠️ Error getting context: {e}")
+        
         return {
             "original_code": content, 
             "file_path": path,
             "current_file_index": current_index,
             "iterations": 0,
-            "error": ""
+            "error": "",
+            "related_context": related_context,
+            "research_iterations": 0  # Reset research counter for new file
         }
+    
+    # --- NEW NODE: Analyze impact before fixing ---
+    def analyze_impact(self, state: AgentState):
+        file_path = state.get("file_path", "")
+        if not file_path or not self.indexer:
+            return {}
+        
+        print(f"🔍 Analyzing impact of changes to {file_path}...")
+        try:
+            impact = self.indexer.analyze_impact(file_path, state.get("code", ""))
+            
+            if impact.get("files_that_import_this"):
+                print(f"⚠️ {len(impact['files_that_import_this'])} file(s) depend on this file")
+                for dep_file in impact["files_that_import_this"][:3]:
+                    print(f"   - {dep_file}")
+            else:
+                print("✅ No other files depend on this file")
+            
+            # Store impact info in state for use in generate_fix
+            impact_msg = impact.get("recommendation", "")
+            return {"extra_context": state.get("extra_context", "") + f"\n\n{impact_msg}"}
+        except Exception as e:
+            print(f"⚠️ Error analyzing impact: {e}")
+            return {}
     
     # --- Node: Fetch Extra Context (The Multi-File Key) ---
     def fetch_extra_context(self, state: AgentState):
         last_msg = state["messages"][-1].content
         match = re.search(r"FETCH_FILE:\s*(\S+)", last_msg)
         
+        # Increment research iterations counter
+        research_iterations = state.get("research_iterations", 0) + 1
+        
         if match:
             extra_path = match.group(1)
-            print(f"🧐 Agent needs to see: {extra_path}")
+            print(f"🧐 Agent needs to see: {extra_path} (research iteration {research_iterations})")
             try:
                 content = self.repo.get_contents(extra_path).decoded_content.decode()
                 new_context = state.get("extra_context", "") + f"\n\n--- Content of {extra_path} ---\n{content}"
-                return {"extra_context": new_context, "messages": [HumanMessage(content=f"Fetched {extra_path}")]}
+                return {
+                    "extra_context": new_context, 
+                    "messages": [HumanMessage(content=f"Fetched {extra_path}")],
+                    "research_iterations": research_iterations
+                }
             except:
-                return {"messages": [HumanMessage(content=f"Error: {extra_path} not found.")]}
-        return {}
+                return {
+                    "messages": [HumanMessage(content=f"Error: {extra_path} not found.")],
+                    "research_iterations": research_iterations
+                }
+        return {"research_iterations": research_iterations}
         
-    # --- Node: Generate (Modified to use Docs) ---
+    # --- Node: Generate (Modified to use Docs + Codebase Context) ---
     def generate_fix(self, state: AgentState):
         signature = "\n\n# CodeSentinal: created for you by RuchirAdnaik."
 
-        # We now pass the documentation into the prompt
+        # Build comprehensive context
+        related_context = state.get("related_context", "")
+        extra_context = state.get("extra_context", "")
+        
+        # Combine all context
+        context_section = ""
+        if related_context:
+            context_section += f"\n\nRELATED FILES (for understanding dependencies and patterns):\n{related_context}"
+        if extra_context:
+            context_section += f"\n\nADDITIONAL CONTEXT:\n{extra_context}"
+
+        # We now pass the documentation + codebase context into the prompt
         prompt = f"""
         PROJECT DOCUMENTATION:
         {state['docs']}
+        
+        {context_section}
 
         CODE TO FIX:
         {state['original_code']}
 
         INSTRUCTIONS:
-        1. Identify the runtime error in the code.
-        2. Fix the error.
-        3. Ensure your fix follows any coding standards or rules mentioned in the PROJECT DOCUMENTATION above.
-        4. Return ONLY the full corrected python code in a markdown block.
-        5. MANDATORY: You must add the following comment as the very last line of the code:
+        1. Analyze the code in the context of the entire codebase. Consider how this file relates to other files shown above.
+        2. Identify the runtime error in the code.
+        3. Fix the error while ensuring your changes don't break other files that depend on this one.
+        4. If you see related files above, ensure your fix maintains compatibility with their expectations (function signatures, imports, etc.).
+        5. Ensure your fix follows any coding standards or rules mentioned in the PROJECT DOCUMENTATION above.
+        6. Return ONLY the full corrected python code in a markdown block.
+        7. MANDATORY: You must add the following comment as the very last line of the code:
            # CodeSentinal: created for you by RuchirAdnaik.
         """
         
@@ -360,8 +539,12 @@ class CodeSentinel:
             code = content.split("```python")[1].split("```")[0].strip()
         else:
             code = content.strip()
-        if "CodeSentinal: created for you by RuchirAdnaik." not in code:
-            code += signature
+
+        # Only append signature if this is a real change vs original
+        original_code = state.get("original_code", "")
+        if original_code.strip() != code.strip():
+            if "CodeSentinal: created for you by RuchirAdnaik." not in code:
+                code += signature
             
         return {"messages": [response], "code": code, "iterations": state.get("iterations", 0) + 1}
 
@@ -383,8 +566,26 @@ class CodeSentinel:
     
     # --- Router: Research vs Test ---
     def decide_research_or_test(self, state: AgentState):
+        # Prevent infinite research loops - limit to 3 research iterations per fix attempt
+        research_iterations = state.get("research_iterations", 0)
+        if research_iterations >= 3:
+            print("⚠️ Research limit reached, proceeding to test")
+            return "test"
+        
         if "FETCH_FILE:" in state["messages"][-1].content:
             return "research"
+        return "test"
+    
+    # --- Router: After Research ---
+    def decide_after_research(self, state: AgentState):
+        """Decide whether to continue research or proceed to testing"""
+        research_iterations = state.get("research_iterations", 0)
+        
+        # If still requesting files and under limit, continue research
+        if "FETCH_FILE:" in state["messages"][-1].content and research_iterations < 3:
+            return "continue_research"
+        
+        # Otherwise, proceed to test (research limit reached or no more file requests)
         return "test"
     
     # --- Router: Check if there are failing files ---
@@ -420,53 +621,107 @@ class CodeSentinel:
             else:
                 return "create_pr"
     
+    def _create_unified_diff(self, original: str, fixed: str, file_path: str) -> str:
+        """Create a unified diff between original and fixed code"""
+        original_lines = original.splitlines(keepends=True)
+        fixed_lines = fixed.splitlines(keepends=True)
+        
+        diff = difflib.unified_diff(
+            original_lines,
+            fixed_lines,
+            fromfile=f"original/{file_path}",
+            tofile=f"fixed/{file_path}",
+            lineterm=''
+        )
+        return ''.join(diff)
+    
     def generate_pr_summary(self, state: AgentState):
         fixed_files = state.get("fixed_files", {})
         failing_files = state.get("failing_files", [])
         original_codes = state.get("original_codes", {})
         file_errors = state.get("file_errors", {})
         
-        if len(fixed_files) > 1:
+        # Filter out files where no actual changes were made
+        files_with_changes = {}
+        for file_path, fixed_code in fixed_files.items():
+            original_code = original_codes.get(file_path, "")
+            # Only include files where code actually changed
+            if original_code.strip() != fixed_code.strip():
+                files_with_changes[file_path] = fixed_code
+        
+        if len(files_with_changes) == 0:
+            # No actual changes made
+            return "## Summary\nNo code changes were required. All files are already correct or errors were external (e.g., network issues)."
+        
+        if len(files_with_changes) > 1:
             # Multi-file PR description
             file_details = []
-            for file_path in fixed_files.keys():
+            for file_path in files_with_changes.keys():
                 original_code = original_codes.get(file_path, "")
                 fixed_code = fixed_files.get(file_path, "")
                 error_msg = file_errors.get(file_path, "Runtime error")
                 
+                # Create actual diff
+                diff = self._create_unified_diff(original_code, fixed_code, file_path)
+                
                 file_details.append(f"""
-File: {file_path}
-Original Error: {error_msg[:500]}
-Original Code (first 200 chars): {original_code[:200]}...
-Fixed Code (first 200 chars): {fixed_code[:200]}...
+=== FILE: {file_path} ===
+
+ORIGINAL ERROR:
+{error_msg[:1000]}
+
+CODE DIFF (showing actual changes):
+```diff
+{diff[:3000] if len(diff) > 3000 else diff}
+```
+
+ORIGINAL CODE (full):
+```python
+{original_code[:2000] if len(original_code) > 2000 else original_code}
+```
+
+FIXED CODE (full):
+```python
+{fixed_code[:2000] if len(fixed_code) > 2000 else fixed_code}
+```
+
 """)
             
             prompt = f"""
-You are a code review expert. Analyze the fixes made to multiple files and write a comprehensive, professional PR description.
+You are a code review expert. Analyze the ACTUAL CODE CHANGES made to multiple files and write a comprehensive, professional PR description.
 
-FILES FIXED ({len(fixed_files)} files):
+IMPORTANT: Only describe files where ACTUAL CODE CHANGES were made. If a file shows no diff (no changes), do NOT include it in the description.
+
+FILES WITH ACTUAL CHANGES ({len(files_with_changes)} files):
 {''.join(file_details)}
 
 TOTAL FILES TESTED: {len(state.get('all_files', []))}
+FILES WITH CHANGES: {len(files_with_changes)}
+FILES WITHOUT CHANGES: {len(fixed_files) - len(files_with_changes)}
 
 Write a detailed PR description with the following structure:
 
 ## Summary
-Brief overview of what was fixed (2-3 sentences).
+Brief overview of what was actually fixed (2-3 sentences). Only mention files that had code changes.
 
 ## Files Fixed
-For EACH file, provide:
+For EACH file that has actual code changes (check the diff!), provide:
 1. **File Name**: [filename]
 2. **Error Description**: What was the error? Explain in detail what went wrong.
 3. **Root Cause**: Why was this error occurring? Explain the underlying issue.
-4. **Solution**: What changes were made to fix it? Be specific about the code changes.
+4. **Solution**: What SPECIFIC code changes were made? Reference the diff - what lines were added, removed, or modified? Be very specific.
 5. **Impact**: How does this fix improve the code?
+
+IMPORTANT: 
+- Only describe files that have actual code changes (non-empty diff)
+- Be specific about what changed - reference line numbers, function names, etc.
+- If a file has no changes, do NOT include it in the description
 
 ## Verification
 - All fixed files have been tested and verified to execute without errors
 - Code follows project standards and best practices
 
-Make the description detailed, professional, and easy to understand. Focus on explaining the "why" behind each error and fix.
+Make the description detailed, professional, and accurate. Focus on the ACTUAL changes made, not assumptions.
 """
         else:
             # Single file PR description
@@ -475,13 +730,25 @@ Make the description detailed, professional, and easy to understand. Focus on ex
             fixed_code = fixed_files.get(file_path, state.get("code", ""))
             error_msg = file_errors.get(file_path, state.get("error", "Runtime error"))
             
+            # Check if there are actual changes
+            if original_code.strip() == fixed_code.strip():
+                return f"## Summary\nNo code changes were required for {file_path}. The error was external (e.g., network issues) or the file is already correct."
+            
+            # Create diff
+            diff = self._create_unified_diff(original_code, fixed_code, file_path)
+            
             prompt = f"""
-You are a code review expert. Analyze the fix made to a file and write a comprehensive, professional PR description.
+You are a code review expert. Analyze the ACTUAL CODE CHANGES made to a file and write a comprehensive, professional PR description.
 
 FILE: {file_path}
 
 ORIGINAL ERROR:
 {error_msg}
+
+CODE DIFF (showing actual changes):
+```diff
+{diff}
+```
 
 ORIGINAL CODE:
 ```python
@@ -496,14 +763,14 @@ FIXED CODE:
 Write a detailed PR description with the following structure:
 
 ## Summary
-Brief overview of what was fixed (2-3 sentences).
+Brief overview of what was actually fixed (2-3 sentences). Be specific about what changed.
 
 ## Error Analysis
 1. **Error Description**: What was the error? Explain in detail what went wrong, including the exact error message and when it occurs.
 2. **Root Cause**: Why was this error occurring? Explain the underlying issue, what caused it, and why the original code was problematic.
 
 ## Solution
-1. **Changes Made**: What specific changes were made to fix the error? List the exact modifications.
+1. **Changes Made**: What SPECIFIC code changes were made? Reference the diff above - what lines were added, removed, or modified? Be very specific with line numbers and code snippets.
 2. **How It Works**: Explain how the fix resolves the issue. Walk through the corrected code logic.
 3. **Code Quality**: Does the fix follow best practices? Are there any improvements beyond just fixing the error?
 
@@ -511,7 +778,7 @@ Brief overview of what was fixed (2-3 sentences).
 - The fixed code has been tested and verified to execute without errors
 - Code follows project standards and best practices
 
-Make the description detailed, professional, and educational. Focus on explaining the "why" behind the error and how the fix addresses it.
+Make the description detailed, professional, and accurate. Focus on the ACTUAL changes shown in the diff, not assumptions.
 """
         summary = self.llm.invoke([HumanMessage(content=prompt)])
         return summary.content
@@ -520,13 +787,18 @@ Make the description detailed, professional, and educational. Focus on explainin
     def create_pr(self, state: AgentState):
         branch_name = f"fix-{uuid.uuid4().hex[:6]}"
         fixed_files = state.get("fixed_files", {}).copy()  # Make a copy to modify
+        original_codes = state.get("original_codes", {})
         
         # Save current file's code if it exists and hasn't been saved yet
         current_file = state.get("file_path", "")
         current_code = state.get("code", "")
         if current_file and current_code and current_file not in fixed_files:
-            fixed_files[current_file] = current_code
-            print(f"💾 Saved fix for {current_file} before creating PR")
+            original = original_codes.get(current_file, state.get("original_code", ""))
+            if original.strip() != current_code.strip():
+                fixed_files[current_file] = current_code
+                print(f"💾 Saved fix for {current_file} before creating PR")
+            else:
+                print(f"⏭️  No changes for {current_file}; skipping save before PR")
         
         # If no fixed files but we have code, use single file mode
         if not fixed_files and state.get("code"):
@@ -535,6 +807,16 @@ Make the description detailed, professional, and educational. Focus on explainin
         # If still no files, create empty PR message
         if not fixed_files:
             msg = "No files needed fixing. All tests passed!"
+            return {"messages": [HumanMessage(content=msg)], "fixed_files": {}}
+
+        # Filter to only files with actual changes (avoid committing tagline-only/no-op updates)
+        fixed_files = {
+            path: code
+            for path, code in fixed_files.items()
+            if original_codes.get(path, "").strip() != code.strip()
+        }
+        if not fixed_files:
+            msg = "No code changes were required. All failures were external (e.g., dependency/network)."
             return {"messages": [HumanMessage(content=msg)], "fixed_files": {}}
         
         # Update state with fixed_files for summary generation
@@ -613,7 +895,11 @@ Make the description detailed, professional, and educational. Focus on explainin
 
     def run(self, file_to_fix=None):
         # 1. Create a unique thread ID for this specific run
-        config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+        # 2. Increase recursion limit to handle multi-file processing
+        config = {
+            "configurable": {"thread_id": str(uuid.uuid4())},
+            "recursion_limit": 100  # Increased from default 25 to handle multiple files
+        }
         
         # 2. Initialize EVERY key to a default empty value
         # This prevents the 'NoneType' error
@@ -631,7 +917,10 @@ Make the description detailed, professional, and educational. Focus on explainin
             "fixed_files": {},
             "original_codes": {},
             "file_errors": {},
-            "current_file_index": 0
+            "current_file_index": 0,
+            "codebase_index": {},
+            "related_context": "",
+            "research_iterations": 0
         }
         
         # 3. Use the initialized state
