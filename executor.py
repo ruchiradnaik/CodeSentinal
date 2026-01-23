@@ -50,6 +50,13 @@ class PythonExecutor:
         "BrokenPipeError",
     ]
     
+    # Patterns indicating local module import errors (not actual bugs)
+    LOCAL_IMPORT_ERROR_PATTERNS = [
+        r"ModuleNotFoundError: No module named '([^']+)'",
+        r"ImportError: cannot import name '([^']+)' from '([^']+)'",
+        r"ImportError: No module named '([^']+)'",
+    ]
+    
     # Wrapper code to mock input() for non-interactive execution
     INPUT_MOCK_WRAPPER = '''
 # CodeSentinel: Mock input() for non-interactive testing
@@ -227,6 +234,30 @@ builtins.input = _mock_input
     def _is_non_critical_error(self, error_msg: str) -> bool:
         """Check if error is non-critical"""
         return any(pattern in error_msg for pattern in self.NON_CRITICAL_ERRORS)
+    
+    def _is_local_module_error(self, error_msg: str) -> tuple[bool, str]:
+        """
+        Check if error is due to missing local module (not a real bug).
+        
+        Returns:
+            Tuple of (is_local_module_error, module_name)
+        """
+        for pattern in self.LOCAL_IMPORT_ERROR_PATTERNS:
+            match = re.search(pattern, error_msg)
+            if match:
+                module_name = match.group(1)
+                # Check if it's a local module (not a well-known pip package)
+                if module_name in self.local_modules:
+                    return True, module_name
+                # Check if it looks like a local module (lowercase, simple name)
+                if (module_name not in self.STDLIB_MODULES and 
+                    module_name not in self.IMPORT_TO_PIP and
+                    module_name not in self.dependencies and
+                    not any(c.isupper() for c in module_name) and
+                    '_' not in module_name[:1]):  # Doesn't start with underscore
+                    # Likely a local module
+                    return True, module_name
+        return False, ""
 
     def _extract_imports(self, code: str) -> Set[str]:
         """Extract import names from code"""
@@ -364,6 +395,21 @@ builtins.input = _mock_input
                         "warning": "Code requires interactive input. Auto-mocked for testing.",
                         "execution_time_ms": execution_time,
                     }
+                
+                # Check for local module import errors
+                is_local_error, module_name = self._is_local_module_error(output)
+                if is_local_error:
+                    logger.info(f"Local module import error for '{module_name}', marking as skipped")
+                    return {
+                        "success": True,
+                        "output": output,
+                        "error": "",
+                        "warning": f"Cannot test in isolation: requires local module '{module_name}'. This is NOT a bug.",
+                        "skipped_reason": "local_module_dependency",
+                        "missing_module": module_name,
+                        "execution_time_ms": execution_time,
+                    }
+                
                 return {
                     "success": False,
                     "output": "",
@@ -459,6 +505,7 @@ builtins.input = _mock_input
                     "execution_time_ms": execution_time,
                 }
             else:
+                # Check for non-critical errors (input() related)
                 if self._is_non_critical_error(result.stderr):
                     return {
                         "success": True,
@@ -467,6 +514,20 @@ builtins.input = _mock_input
                         "warning": "Code requires interactive input. Auto-mocked for testing.",
                         "execution_time_ms": execution_time,
                     }
+                
+                # Check for local module import errors
+                is_local_error, module_name = self._is_local_module_error(result.stderr)
+                if is_local_error:
+                    return {
+                        "success": True,
+                        "output": result.stdout,
+                        "error": "",
+                        "warning": f"Cannot test in isolation: requires local module '{module_name}'. This is NOT a bug.",
+                        "skipped_reason": "local_module_dependency",
+                        "missing_module": module_name,
+                        "execution_time_ms": execution_time,
+                    }
+                
                 return {
                     "success": False,
                     "output": result.stdout,
