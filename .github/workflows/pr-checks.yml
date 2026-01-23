@@ -1,0 +1,137 @@
+# =============================================================================
+# CodeSentinel PR Checks
+# Runs on pull requests for quality gates
+# =============================================================================
+
+name: PR Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  # ===========================================================================
+  # PR Validation
+  # ===========================================================================
+  pr-validation:
+    name: 📋 PR Validation
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 📋 Check PR title format
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          echo "PR Title: $PR_TITLE"
+          
+          # Check for conventional commit format (optional)
+          if [[ ! "$PR_TITLE" =~ ^(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)(\(.+\))?:\ .+ ]]; then
+            echo "::warning::PR title doesn't follow conventional commit format"
+            echo "Consider using: feat|fix|docs|style|refactor|test|chore: description"
+          fi
+
+      - name: 📊 Check PR size
+        run: |
+          ADDITIONS=${{ github.event.pull_request.additions }}
+          DELETIONS=${{ github.event.pull_request.deletions }}
+          TOTAL=$((ADDITIONS + DELETIONS))
+          
+          echo "PR Stats:"
+          echo "  - Additions: $ADDITIONS"
+          echo "  - Deletions: $DELETIONS"
+          echo "  - Total changes: $TOTAL"
+          
+          if [ $TOTAL -gt 1000 ]; then
+            echo "::warning::Large PR detected ($TOTAL lines). Consider breaking into smaller PRs."
+          fi
+
+  # ===========================================================================
+  # Code Coverage
+  # ===========================================================================
+  coverage:
+    name: 📊 Code Coverage
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest-cov
+
+      - name: 🧪 Run tests with coverage
+        run: |
+          python -m pytest tests/ --cov=. --cov-report=xml --cov-report=term-missing --cov-fail-under=50
+        env:
+          OPENAI_API_KEY: "test-key-for-ci"
+          GITHUB_TOKEN: "test-token-for-ci"
+          DOCKER_ENABLED: "false"
+          ENVIRONMENT: "testing"
+        continue-on-error: true
+
+      - name: 📊 Coverage Summary
+        run: |
+          echo "## 📊 Test Coverage Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f coverage.xml ]; then
+            echo "Coverage report generated successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Coverage report not generated" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ===========================================================================
+  # Dependency Check
+  # ===========================================================================
+  dependencies:
+    name: 📦 Dependency Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: 📦 Check for dependency updates
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+          
+          echo "## 📦 Dependency Audit" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          pip-audit -r requirements.txt --desc || echo "::warning::Some dependencies have known vulnerabilities"
+
+  # ===========================================================================
+  # Label PR
+  # ===========================================================================
+  labeler:
+    name: 🏷️ Auto Label
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: 🏷️ Add labels based on files changed
+        uses: actions/labeler@v5
+        with:
+          repo-token: "${{ secrets.GITHUB_TOKEN }}"
+        continue-on-error: true

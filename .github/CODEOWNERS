@@ -1,0 +1,24 @@
+# =============================================================================
+# CodeSentinel Code Owners
+# These owners will be requested for review on PRs
+# =============================================================================
+
+# Default owner for everything
+* @RuchirAdnaik
+
+# Core application
+/app.py @RuchirAdnaik
+/agent.py @RuchirAdnaik
+/executor.py @RuchirAdnaik
+
+# Configuration and infrastructure
+/config.py @RuchirAdnaik
+/Dockerfile* @RuchirAdnaik
+/docker-compose*.yml @RuchirAdnaik
+/.github/ @RuchirAdnaik
+
+# Tests
+/tests/ @RuchirAdnaik
+
+# Documentation
+*.md @RuchirAdnaik

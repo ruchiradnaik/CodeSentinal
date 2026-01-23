@@ -1,0 +1,77 @@
+# =============================================================================
+# GitHub Labeler Configuration
+# Auto-labels PRs based on files changed
+# =============================================================================
+
+# Core application
+app:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'app.py'
+          - 'agent.py'
+          - 'executor.py'
+
+# Tests
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'tests/**/*'
+          - 'pytest.ini'
+
+# Documentation
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '*.md'
+          - 'docs/**/*'
+
+# Configuration
+config:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'config.py'
+          - '*.yml'
+          - '*.yaml'
+          - '.env*'
+          - 'env.example'
+
+# Docker
+docker:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'Dockerfile*'
+          - 'docker-compose*.yml'
+
+# CI/CD
+ci-cd:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**/*'
+          - 'Makefile'
+
+# Dependencies
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'requirements.txt'
+          - 'setup.py'
+          - 'pyproject.toml'
+
+# GitHub Integration
+github:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'github_*.py'
+
+# Logging
+logging:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'logger.py'
+
+# Indexing
+indexing:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'codebase_indexer.py'
+          - 'dependency_detector.py'
