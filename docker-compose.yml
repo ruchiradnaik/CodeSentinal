@@ -1,0 +1,102 @@
+version: '3.8'
+
+# =============================================================================
+# CodeSentinel Docker Compose Configuration
+# Production-ready deployment with all services
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Main Application
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: codesentinel-app
+    restart: unless-stopped
+    
+    ports:
+      - "${PORT:-8501}:8501"
+    
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FILE=/app/logs/codesentinel.log
+      - LOG_JSON=true
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPEN_API_KEY=${OPEN_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - DOCKER_ENABLED=true
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - DOCKER_NETWORK_DISABLED=true
+      - DOCKER_MEMORY_LIMIT=256m
+      - DOCKER_TIMEOUT=30
+    
+    volumes:
+      # Mount Docker socket for container-in-container execution
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Persistent logs
+      - codesentinel-logs:/app/logs
+      # Persistent data
+      - codesentinel-data:/app/data
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    
+    networks:
+      - codesentinel-network
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Sandbox Builder (builds the sandbox image)
+  # ---------------------------------------------------------------------------
+  sandbox-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.sandbox
+    image: codesentinel-sandbox:latest
+    container_name: codesentinel-sandbox-builder
+    command: ["echo", "Sandbox image built successfully"]
+    profiles:
+      - build
+    networks:
+      - codesentinel-network
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  codesentinel-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  codesentinel-logs:
+    driver: local
+  codesentinel-data:
+    driver: local
