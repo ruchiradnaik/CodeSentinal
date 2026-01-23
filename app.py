@@ -192,7 +192,9 @@ def validate_repo_url(repo: str) -> tuple[bool, str]:
         repo = repo.replace("github.com/", "")
     
     # Remove trailing slashes and .git
-    repo = repo.rstrip("/").rstrip(".git")
+    repo = repo.rstrip("/")
+    if repo.endswith(".git"):
+        repo = repo[:-4]
     
     # Validate format
     parts = repo.split("/")
