@@ -1,4 +1,9 @@
 import os
+
+# Fix OpenMP conflict on macOS (MUST be set before any numpy/faiss imports)
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import operator
 import uuid
 import difflib
@@ -311,6 +316,7 @@ class CodeSentinel:
         print(f"🧪 Testing {len(state.get('all_files', []))} file(s)...")
         all_files = state.get("all_files", [])
         failing_files = []
+        skipped_files = []  # Files skipped due to local module dependencies
         original_codes = {}
         file_errors = {}
         
@@ -339,8 +345,35 @@ class CodeSentinel:
                 # Test the file
                 result = self.executor.execute(content)
                 
+                # Check if file was skipped due to local module dependency
+                if result.get("skipped_reason") == "local_module_dependency":
+                    missing_module = result.get("missing_module", "unknown")
+                    print(f"  ⏭️  {file_path} skipped (needs local module: {missing_module})")
+                    skipped_files.append(file_path)
+                    continue
+                
+                # Check for warnings (input mocking, etc.) - still counts as passed
+                if result.get("warning") and result.get("success", False):
+                    print(f"  ✅ {file_path} passed (with warning: {result.get('warning')[:50]}...)")
+                    continue
+                
                 if result.get("error") or not result.get("success", False):
                     error_msg = result.get("error", "Unknown error")
+                    
+                    # Double-check: don't add if it's a local module error that slipped through
+                    if "ModuleNotFoundError" in error_msg or "ImportError" in error_msg:
+                        # Check if the missing module is a local one
+                        import re
+                        match = re.search(r"No module named '([^']+)'", error_msg)
+                        if match:
+                            module_name = match.group(1)
+                            # Check if it looks like a local module (exists in repo)
+                            local_module_files = [f.replace('.py', '') for f in all_files]
+                            if module_name in local_module_files or module_name in [f.split('/')[-1].replace('.py', '') for f in all_files]:
+                                print(f"  ⏭️  {file_path} skipped (needs local module: {module_name})")
+                                skipped_files.append(file_path)
+                                continue
+                    
                     print(f"  ❌ {file_path} failed: {error_msg[:100]}")
                     failing_files.append(file_path)
                     file_errors[file_path] = error_msg
@@ -360,13 +393,29 @@ class CodeSentinel:
                         except:
                             original_codes[file_path] = ""
         
-        print(f"📊 Test Results: {len(failing_files)} file(s) need fixing out of {len(all_files)} tested")
+        # Print summary
+        passed_count = len(all_files) - len(failing_files) - len(skipped_files)
+        print(f"📊 Test Results:")
+        print(f"   ✅ Passed: {passed_count}")
+        print(f"   ❌ Failed: {len(failing_files)}")
+        print(f"   ⏭️  Skipped (local dependencies): {len(skipped_files)}")
+        print(f"   📁 Total tested: {len(all_files)}")
+        
+        # Build summary message
+        summary_parts = [f"Tested {len(all_files)} file(s)."]
+        if failing_files:
+            summary_parts.append(f"Found {len(failing_files)} file(s) with REAL errors that need fixing: {', '.join(failing_files)}")
+        else:
+            summary_parts.append("No real errors found that need fixing.")
+        if skipped_files:
+            summary_parts.append(f"Skipped {len(skipped_files)} file(s) due to local module dependencies (not bugs): {', '.join(skipped_files)}")
         
         return {
             "failing_files": failing_files,
             "original_codes": original_codes,
             "file_errors": file_errors,
-            "messages": [HumanMessage(content=f"Tested {len(all_files)} file(s). Found {len(failing_files)} file(s) that need fixing: {', '.join(failing_files) if failing_files else 'None'}")]
+            "skipped_files": skipped_files,
+            "messages": [HumanMessage(content=" ".join(summary_parts))]
         }
 
     # --- Node: Process next file ---

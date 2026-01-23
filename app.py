@@ -1,5 +1,10 @@
-import streamlit as st
 import os
+
+# Fix OpenMP conflict on macOS (MUST be set before any numpy/faiss imports)
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['OMP_NUM_THREADS'] = '1'
+
+import streamlit as st
 import difflib
 import json
 import zipfile
@@ -46,74 +51,501 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better UI
+# === MODERN UI CSS ===
 st.markdown("""
 <style>
-    /* Fix chat input to bottom of viewport */
+    /* ============================================
+       CODESENTINEL MODERN UI THEME
+       ============================================ */
+    
+    /* === ROOT VARIABLES === */
+    :root {
+        --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        --secondary-gradient: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        --success-gradient: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        --warning-gradient: linear-gradient(135deg, #F2994A 0%, #F2C94C 100%);
+        --error-gradient: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);
+        --dark-bg: #0f0f23;
+        --card-bg: rgba(255, 255, 255, 0.05);
+        --glass-bg: rgba(255, 255, 255, 0.1);
+        --border-color: rgba(255, 255, 255, 0.1);
+        --text-primary: #ffffff;
+        --text-secondary: rgba(255, 255, 255, 0.7);
+        --accent-blue: #667eea;
+        --accent-purple: #764ba2;
+        --accent-green: #38ef7d;
+    }
+    
+    /* === GLOBAL STYLES === */
+    .stApp {
+        background: linear-gradient(180deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%);
+    }
+    
+    /* === SIDEBAR STYLING === */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, rgba(15, 15, 35, 0.95) 0%, rgba(26, 26, 46, 0.95) 100%);
+        backdrop-filter: blur(10px);
+        border-right: 1px solid var(--border-color);
+    }
+    
+    [data-testid="stSidebar"] .block-container {
+        padding-top: 2rem;
+    }
+    
+    /* === HEADER STYLING === */
+    h1 {
+        background: var(--primary-gradient);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        font-weight: 800 !important;
+        letter-spacing: -1px;
+    }
+    
+    h2, h3 {
+        color: var(--text-primary) !important;
+        font-weight: 600 !important;
+    }
+    
+    /* === GLASSMORPHISM CARDS === */
+    .glass-card {
+        background: var(--glass-bg);
+        backdrop-filter: blur(10px);
+        border-radius: 16px;
+        border: 1px solid var(--border-color);
+        padding: 1.5rem;
+        margin: 1rem 0;
+        transition: all 0.3s ease;
+    }
+    
+    .glass-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 32px rgba(102, 126, 234, 0.2);
+        border-color: var(--accent-blue);
+    }
+    
+    /* === CHAT INPUT FIXED BOTTOM === */
     [data-testid="stChatInput"] {
         position: fixed !important;
         bottom: 0 !important;
         left: var(--sidebar-width, 21rem);
         right: 0;
-        padding: 1rem 2rem 1rem 2rem;
-        background: #0e1117;
+        padding: 1rem 2rem;
+        background: linear-gradient(180deg, transparent 0%, rgba(15, 15, 35, 0.98) 20%);
+        backdrop-filter: blur(20px);
         z-index: 999;
-        border-top: 1px solid #333;
+        border-top: 1px solid var(--border-color);
     }
     
-    /* When sidebar is collapsed */
     [data-testid="stSidebar"][aria-expanded="false"] ~ .main [data-testid="stChatInput"] {
         left: 0;
     }
     
-    /* Add padding to main content so messages don't hide behind input */
+    /* === CHAT INPUT BOX === */
+    [data-testid="stChatInput"] > div {
+        background: var(--glass-bg) !important;
+        border: 1px solid var(--border-color) !important;
+        border-radius: 12px !important;
+        transition: all 0.3s ease;
+    }
+    
+    [data-testid="stChatInput"] > div:focus-within {
+        border-color: var(--accent-blue) !important;
+        box-shadow: 0 0 20px rgba(102, 126, 234, 0.3);
+    }
+    
+    /* === MAIN CONTENT PADDING === */
     .main .block-container {
         padding-bottom: 120px !important;
+        padding-top: 2rem !important;
     }
     
-    /* Chat messages styling */
-    [data-testid="stChatMessage"] { 
-        border-radius: 15px; 
-        margin-bottom: 10px; 
+    /* === CHAT MESSAGES === */
+    [data-testid="stChatMessage"] {
+        background: var(--card-bg);
+        border-radius: 16px;
+        border: 1px solid var(--border-color);
+        margin-bottom: 1rem;
+        padding: 1rem;
+        animation: fadeInUp 0.3s ease;
     }
     
-    .stStatusWidget { border-radius: 10px; }
-    .diff-added { background-color: #1e4620; padding: 2px 5px; border-radius: 3px; }
-    .diff-removed { background-color: #5c1e1e; padding: 2px 5px; border-radius: 3px; }
-    .file-tree { font-family: monospace; font-size: 14px; }
-    .metric-card { 
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-        padding: 20px;
+    @keyframes fadeInUp {
+        from {
+            opacity: 0;
+            transform: translateY(10px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
+    }
+    
+    /* === BUTTONS === */
+    .stButton > button {
+        background: var(--primary-gradient) !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 10px !important;
+        padding: 0.6rem 1.5rem !important;
+        font-weight: 600 !important;
+        transition: all 0.3s ease !important;
+        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+    }
+    
+    .stButton > button:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4) !important;
+    }
+    
+    .stButton > button:active {
+        transform: translateY(0) !important;
+    }
+    
+    /* === TEXT INPUTS === */
+    .stTextInput > div > div > input {
+        background: var(--glass-bg) !important;
+        border: 1px solid var(--border-color) !important;
+        border-radius: 10px !important;
+        color: var(--text-primary) !important;
+        transition: all 0.3s ease;
+    }
+    
+    .stTextInput > div > div > input:focus {
+        border-color: var(--accent-blue) !important;
+        box-shadow: 0 0 15px rgba(102, 126, 234, 0.2);
+    }
+    
+    /* === SELECT BOXES === */
+    .stSelectbox > div > div {
+        background: var(--glass-bg) !important;
+        border: 1px solid var(--border-color) !important;
+        border-radius: 10px !important;
+    }
+    
+    /* === RADIO BUTTONS === */
+    .stRadio > div {
+        background: var(--card-bg);
+        border-radius: 12px;
+        padding: 1rem;
+        border: 1px solid var(--border-color);
+    }
+    
+    .stRadio > div > label {
+        padding: 0.5rem 1rem;
+        border-radius: 8px;
+        transition: all 0.2s ease;
+    }
+    
+    .stRadio > div > label:hover {
+        background: var(--glass-bg);
+    }
+    
+    /* === TABS === */
+    .stTabs [data-baseweb="tab-list"] {
+        background: var(--card-bg);
+        border-radius: 12px;
+        padding: 0.5rem;
+        gap: 0.5rem;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px !important;
+        padding: 0.5rem 1rem;
+        transition: all 0.2s ease;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background: var(--primary-gradient) !important;
+    }
+    
+    /* === METRICS === */
+    [data-testid="stMetric"] {
+        background: var(--glass-bg);
+        border-radius: 12px;
+        padding: 1rem;
+        border: 1px solid var(--border-color);
+        transition: all 0.3s ease;
+    }
+    
+    [data-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        border-color: var(--accent-blue);
+    }
+    
+    [data-testid="stMetricValue"] {
+        background: var(--primary-gradient);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        font-weight: 700 !important;
+    }
+    
+    /* === EXPANDERS === */
+    .streamlit-expanderHeader {
+        background: var(--glass-bg) !important;
+        border-radius: 10px !important;
+        border: 1px solid var(--border-color) !important;
+        transition: all 0.3s ease;
+    }
+    
+    .streamlit-expanderHeader:hover {
+        border-color: var(--accent-blue) !important;
+    }
+    
+    /* === CODE BLOCKS === */
+    .stCodeBlock {
+        border-radius: 12px !important;
+        border: 1px solid var(--border-color) !important;
+    }
+    
+    /* === STATUS WIDGETS === */
+    .stStatusWidget {
+        border-radius: 12px !important;
+        background: var(--glass-bg) !important;
+        border: 1px solid var(--border-color) !important;
+    }
+    
+    /* === SUCCESS/ERROR/WARNING MESSAGES === */
+    .stSuccess {
+        background: linear-gradient(135deg, rgba(17, 153, 142, 0.2) 0%, rgba(56, 239, 125, 0.2) 100%) !important;
+        border: 1px solid rgba(56, 239, 125, 0.3) !important;
+        border-radius: 10px !important;
+    }
+    
+    .stError {
+        background: linear-gradient(135deg, rgba(235, 51, 73, 0.2) 0%, rgba(244, 92, 67, 0.2) 100%) !important;
+        border: 1px solid rgba(244, 92, 67, 0.3) !important;
+        border-radius: 10px !important;
+    }
+    
+    .stWarning {
+        background: linear-gradient(135deg, rgba(242, 153, 74, 0.2) 0%, rgba(242, 201, 76, 0.2) 100%) !important;
+        border: 1px solid rgba(242, 201, 76, 0.3) !important;
+        border-radius: 10px !important;
+    }
+    
+    .stInfo {
+        background: linear-gradient(135deg, rgba(102, 126, 234, 0.2) 0%, rgba(118, 75, 162, 0.2) 100%) !important;
+        border: 1px solid rgba(102, 126, 234, 0.3) !important;
+        border-radius: 10px !important;
+    }
+    
+    /* === DIVIDERS === */
+    hr {
+        border: none;
+        height: 1px;
+        background: linear-gradient(90deg, transparent 0%, var(--border-color) 50%, transparent 100%);
+        margin: 1.5rem 0;
+    }
+    
+    /* === FILE UPLOADER === */
+    [data-testid="stFileUploader"] {
+        background: var(--glass-bg);
+        border: 2px dashed var(--border-color);
+        border-radius: 12px;
+        padding: 1rem;
+        transition: all 0.3s ease;
+    }
+    
+    [data-testid="stFileUploader"]:hover {
+        border-color: var(--accent-blue);
+        background: rgba(102, 126, 234, 0.1);
+    }
+    
+    /* === DIFF STYLING === */
+    .diff-added {
+        background: linear-gradient(90deg, rgba(56, 239, 125, 0.3) 0%, rgba(56, 239, 125, 0.1) 100%);
+        padding: 2px 8px;
+        border-radius: 4px;
+        border-left: 3px solid var(--accent-green);
+    }
+    
+    .diff-removed {
+        background: linear-gradient(90deg, rgba(244, 92, 67, 0.3) 0%, rgba(244, 92, 67, 0.1) 100%);
+        padding: 2px 8px;
+        border-radius: 4px;
+        border-left: 3px solid #f45c43;
+    }
+    
+    /* === FILE TREE === */
+    .file-tree {
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 13px;
+        line-height: 1.8;
+        background: var(--card-bg);
+        padding: 1rem;
         border-radius: 10px;
-        border: 1px solid #333;
+        border: 1px solid var(--border-color);
     }
+    
+    /* === LOG OUTPUT === */
     .log-output {
-        background-color: #0d1117;
-        padding: 10px;
-        border-radius: 5px;
-        font-family: monospace;
+        background: rgba(0, 0, 0, 0.3);
+        padding: 1rem;
+        border-radius: 10px;
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
         font-size: 12px;
         max-height: 300px;
         overflow-y: auto;
+        border: 1px solid var(--border-color);
     }
+    
+    /* === TEMPLATE CARDS === */
     .template-card {
-        border: 1px solid #333;
-        border-radius: 10px;
-        padding: 15px;
-        margin: 5px 0;
+        background: var(--glass-bg);
+        border: 1px solid var(--border-color);
+        border-radius: 12px;
+        padding: 1rem;
+        margin: 0.5rem 0;
         cursor: pointer;
+        transition: all 0.3s ease;
     }
+    
     .template-card:hover {
-        border-color: #4CAF50;
-        background-color: #1a1a2e;
+        border-color: var(--accent-blue);
+        background: rgba(102, 126, 234, 0.1);
+        transform: translateX(5px);
+    }
+    
+    /* === PROGRESS BARS === */
+    .stProgress > div > div {
+        background: var(--primary-gradient) !important;
+        border-radius: 10px !important;
+    }
+    
+    /* === SPINNERS === */
+    .stSpinner > div {
+        border-color: var(--accent-blue) transparent transparent transparent !important;
+    }
+    
+    /* === TOOLTIPS === */
+    [data-testid="stTooltipIcon"] {
+        color: var(--accent-blue) !important;
+    }
+    
+    /* === DOWNLOAD BUTTON === */
+    .stDownloadButton > button {
+        background: var(--success-gradient) !important;
+        box-shadow: 0 4px 15px rgba(56, 239, 125, 0.3);
+    }
+    
+    .stDownloadButton > button:hover {
+        box-shadow: 0 6px 20px rgba(56, 239, 125, 0.4) !important;
+    }
+    
+    /* === CHECKBOX === */
+    .stCheckbox > label > span {
+        transition: all 0.2s ease;
+    }
+    
+    /* === SLIDER === */
+    .stSlider > div > div > div {
+        background: var(--primary-gradient) !important;
+    }
+    
+    /* === SCROLLBAR === */
+    ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+    
+    ::-webkit-scrollbar-track {
+        background: var(--dark-bg);
+        border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+        background: var(--glass-bg);
+        border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--accent-blue);
+    }
+    
+    /* === ANIMATIONS === */
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+    
+    @keyframes slideIn {
+        from {
+            opacity: 0;
+            transform: translateX(-20px);
+        }
+        to {
+            opacity: 1;
+            transform: translateX(0);
+        }
+    }
+    
+    @keyframes glow {
+        0%, 100% { box-shadow: 0 0 5px var(--accent-blue); }
+        50% { box-shadow: 0 0 20px var(--accent-blue); }
+    }
+    
+    /* === BADGE STYLES === */
+    .badge {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 20px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    
+    .badge-success {
+        background: var(--success-gradient);
+        color: white;
+    }
+    
+    .badge-warning {
+        background: var(--warning-gradient);
+        color: white;
+    }
+    
+    .badge-error {
+        background: var(--error-gradient);
+        color: white;
+    }
+    
+    .badge-info {
+        background: var(--primary-gradient);
+        color: white;
+    }
+    
+    /* === FLOATING ELEMENTS === */
+    .floating {
+        animation: float 3s ease-in-out infinite;
+    }
+    
+    @keyframes float {
+        0%, 100% { transform: translateY(0); }
+        50% { transform: translateY(-10px); }
+    }
+    
+    /* === RESPONSIVE === */
+    @media (max-width: 768px) {
+        [data-testid="stChatInput"] {
+            left: 0 !important;
+            padding: 0.5rem 1rem;
+        }
+        
+        .main .block-container {
+            padding: 1rem !important;
+            padding-bottom: 100px !important;
+        }
     }
 </style>
+
 <script>
     // Auto-scroll to bottom of page when new content is added
     const scrollToBottom = () => {
         window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});
     };
-    // Run on load and observe for changes
     setTimeout(scrollToBottom, 100);
     const observer = new MutationObserver(scrollToBottom);
     observer.observe(document.body, {childList: true, subtree: true});
@@ -427,13 +859,35 @@ def add_to_history(action: str, details: dict):
         "details": details
     })
 
-# --- Main Title ---
-st.title("🤖 CodeSentinel AI")
-st.caption("AI-Powered Development Assistant • Fix Code • Create Projects • Get Help")
+# --- Main Title with Modern Header ---
+st.markdown("""
+<div style="text-align: center; padding: 1rem 0 2rem 0;">
+    <h1 style="font-size: 3rem; margin-bottom: 0.5rem;">
+        🤖 CodeSentinel AI
+    </h1>
+    <p style="color: rgba(255,255,255,0.7); font-size: 1.1rem; margin: 0;">
+        AI-Powered Development Assistant • Fix Code • Create Projects • Get Help
+    </p>
+    <div style="display: flex; justify-content: center; gap: 1rem; margin-top: 1rem;">
+        <span style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.75rem;">✨ GPT-4 Powered</span>
+        <span style="background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.75rem;">🐳 Docker Sandbox</span>
+        <span style="background: linear-gradient(135deg, #F2994A 0%, #F2C94C 100%); padding: 0.3rem 0.8rem; border-radius: 20px; font-size: 0.75rem;">🔒 Secure Execution</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 # --- Sidebar ---
 with st.sidebar:
-    st.header("🎛️ Control Panel")
+    # Sidebar Logo/Header
+    st.markdown("""
+    <div style="text-align: center; padding: 1rem 0; margin-bottom: 1rem; border-bottom: 1px solid rgba(255,255,255,0.1);">
+        <div style="font-size: 2rem; margin-bottom: 0.5rem;">🛡️</div>
+        <div style="font-size: 1.2rem; font-weight: 700; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">CodeSentinel</div>
+        <div style="font-size: 0.75rem; color: rgba(255,255,255,0.5);">v1.0.0</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("### 🎛️ Control Panel")
     
     # Mode Selection with icons
     mode = st.radio(
@@ -891,11 +1345,17 @@ I'm your AI coding assistant, specialized **only** in software development topic
                                         # Handle warnings from input() mocking
                                         warning = result.get("warning", "")
                                         
+                                        # Check if file was skipped due to local module dependency
+                                        skipped_reason = result.get("skipped_reason", "")
+                                        missing_module = result.get("missing_module", "")
+                                        
                                         results[file.name] = {
                                             "original": content,
                                             "success": result.get("success", False),
                                             "error": result.get("error", ""),
-                                            "warning": warning
+                                            "warning": warning,
+                                            "skipped": skipped_reason == "local_module_dependency",
+                                            "missing_module": missing_module
                                         }
                                     except Exception as file_error:
                                         results[file.name] = {
@@ -908,17 +1368,24 @@ I'm your AI coding assistant, specialized **only** in software development topic
                                 # Show results
                                 status.update(label="✅ Analysis Complete", state="complete")
                                 
-                                passed = sum(1 for r in results.values() if r["success"])
-                                failed = len(results) - passed
+                                # Count different statuses
+                                passed = sum(1 for r in results.values() if r["success"] and not r.get("skipped"))
+                                failed = sum(1 for r in results.values() if not r["success"])
+                                skipped = sum(1 for r in results.values() if r.get("skipped"))
                                 
-                                col1, col2 = st.columns(2)
+                                col1, col2, col3 = st.columns(3)
                                 with col1:
                                     st.metric("✅ Passed", passed)
                                 with col2:
                                     st.metric("❌ Failed", failed)
+                                with col3:
+                                    st.metric("⏭️ Skipped", skipped)
                                 
                                 for filename, data in results.items():
-                                    if data["success"]:
+                                    if data.get("skipped"):
+                                        # File was skipped due to local module dependency - not an error
+                                        st.info(f"⏭️ {filename} - Skipped (needs local module: {data.get('missing_module', 'unknown')}). This is NOT a bug.")
+                                    elif data["success"]:
                                         if data.get("warning"):
                                             st.info(f"⚠️ {filename} - {data['warning']}")
                                         else:
@@ -1144,12 +1611,34 @@ with tab3:
         - `Ctrl+K` - Clear chat
         """)
 
-# --- Footer ---
-st.divider()
-col1, col2, col3 = st.columns([2, 1, 1])
-with col1:
-    st.caption("🛡️ CodeSentinel AI - Built by RuchirAdnaik")
-with col2:
-    st.caption(f"Mode: {mode}")
-with col3:
-    st.caption(f"Session: {len(st.session_state.history)} actions")
+# --- Modern Footer ---
+st.markdown("""
+<div style="
+    margin-top: 3rem;
+    padding: 1.5rem;
+    background: rgba(255,255,255,0.02);
+    border-top: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px 12px 0 0;
+    text-align: center;
+">
+    <div style="display: flex; justify-content: center; align-items: center; gap: 2rem; flex-wrap: wrap;">
+        <div>
+            <span style="color: rgba(255,255,255,0.5); font-size: 0.85rem;">🛡️ CodeSentinel AI</span>
+            <span style="color: rgba(255,255,255,0.3);"> • </span>
+            <span style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 600;">Built with ❤️ by Ruchir Adnaik</span>
+        </div>
+    </div>
+    <div style="margin-top: 0.5rem; font-size: 0.75rem; color: rgba(255,255,255,0.3);">
+        Powered by GPT-4 • LangGraph • Docker • FAISS
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# Session info in sidebar
+with st.sidebar:
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.caption(f"📍 {mode.split()[1] if len(mode.split()) > 1 else mode}")
+    with col2:
+        st.caption(f"📊 {len(st.session_state.history)} actions")

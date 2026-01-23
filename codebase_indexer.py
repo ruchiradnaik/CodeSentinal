@@ -2,6 +2,11 @@
 Codebase Indexer: Creates embeddings and understands relationships between files
 """
 import os
+
+# Fix OpenMP conflict on macOS (must be set before importing numpy/faiss)
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['OMP_NUM_THREADS'] = '1'  # Limit OpenMP threads to prevent conflicts
+
 import re
 import ast
 from typing import Dict, List, Set, Tuple, Optional

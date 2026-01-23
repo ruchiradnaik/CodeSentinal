@@ -42,11 +42,11 @@ install:
 
 dev:
 	@echo "🚀 Starting development server..."
-	ENVIRONMENT=development LOG_LEVEL=DEBUG streamlit run app.py
+	KMP_DUPLICATE_LIB_OK=TRUE ENVIRONMENT=development LOG_LEVEL=DEBUG streamlit run app.py
 
 run:
 	@echo "🚀 Starting application..."
-	streamlit run app.py --server.port=8501 --server.address=0.0.0.0
+	KMP_DUPLICATE_LIB_OK=TRUE streamlit run app.py --server.port=8501 --server.address=0.0.0.0
 
 test:
 	@echo "🧪 Running all tests..."
