@@ -1,0 +1,55 @@
+# =============================================================================
+# CodeSentinel Sandbox Dockerfile
+# Secure, minimal environment for executing untrusted code
+# =============================================================================
+
+FROM python:3.11-slim
+
+# Security: Create non-root user with minimal permissions
+RUN groupadd -r sandbox && \
+    useradd -r -g sandbox -d /sandbox -s /sbin/nologin sandbox
+
+# Set working directory
+WORKDIR /sandbox
+
+# Install common packages that are frequently needed
+# This reduces runtime pip installs and improves performance
+RUN pip install --no-cache-dir \
+    numpy \
+    pandas \
+    requests \
+    flask \
+    fastapi \
+    pytest \
+    black \
+    pylint \
+    && rm -rf /root/.cache
+
+# Create execution directory
+RUN mkdir -p /sandbox/code && \
+    chown -R sandbox:sandbox /sandbox
+
+# Security hardening
+# Remove unnecessary tools that could be used maliciously
+RUN apt-get update && \
+    apt-get remove -y --allow-remove-essential \
+    wget \
+    curl \
+    || true && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set restrictive permissions
+RUN chmod 750 /sandbox && \
+    chmod 770 /sandbox/code
+
+# Environment
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HOME=/sandbox
+
+# Switch to non-root user
+USER sandbox
+
+# Default command (will be overridden)
+CMD ["python", "--version"]
