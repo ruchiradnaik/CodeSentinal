@@ -3,7 +3,7 @@
 # Secure, minimal environment for executing untrusted code
 # =============================================================================
 
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 # Security: Create non-root user with minimal permissions
 RUN groupadd -r sandbox && \
