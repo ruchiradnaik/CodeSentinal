@@ -80,7 +80,9 @@ builtins.input = _mock_input
 '''
 
     # Standard library modules to exclude from pip install
+    # This is a comprehensive list of Python standard library modules
     STDLIB_MODULES = {
+        # Core
         "sys", "os", "re", "json", "time", "math", "hashlib", "subprocess",
         "typing", "pathlib", "datetime", "collections", "itertools", "functools",
         "io", "string", "random", "copy", "pickle", "sqlite3", "csv", "logging",
@@ -90,6 +92,35 @@ builtins.input = _mock_input
         "codecs", "unicodedata", "locale", "gettext", "argparse", "configparser",
         "warnings", "traceback", "gc", "inspect", "dis", "code", "codeop",
         "pprint", "reprlib", "enum", "graphlib", "operator", "dataclasses",
+        # Math & Statistics
+        "statistics", "decimal", "fractions", "numbers", "cmath",
+        # Data structures
+        "array", "bisect", "heapq", "queue", "types", "weakref",
+        # Text processing
+        "textwrap", "difflib", "readline", "rlcompleter",
+        # Async & Concurrency
+        "asyncio", "concurrent", "contextvars", "select", "selectors", "signal",
+        # Compression & Archives
+        "zipfile", "tarfile", "gzip", "bz2", "lzma", "zlib",
+        # Import system
+        "zipimport", "pkgutil", "modulefinder", "runpy", "importlib",
+        # AST & Code
+        "ast", "token", "tokenize", "symtable", "keyword", "linecache",
+        # Debugging & Profiling
+        "pdb", "profile", "cProfile", "pstats", "timeit", "trace", "tracemalloc",
+        # System
+        "platform", "errno", "ctypes", "faulthandler", "atexit", "builtins",
+        "sysconfig", "site",
+        # Networking
+        "ssl", "ipaddress", "mimetypes",
+        # Testing
+        "doctest", "test",
+        # Misc
+        "mmap", "sched", "calendar", "getpass", "curses", "tty", "pty", "fcntl",
+        "grp", "pwd", "resource", "termios",
+        # Common submodules that might be imported directly
+        "os.path", "urllib.request", "urllib.parse", "http.client", "http.server",
+        "collections.abc", "typing.extensions",
     }
     
     # Import name to pip package mapping
@@ -258,6 +289,41 @@ builtins.input = _mock_input
                     # Likely a local module
                     return True, module_name
         return False, ""
+    
+    def _detect_soft_error(self, output: str) -> Optional[str]:
+        """
+        Detect errors that were caught by try/except but still indicate bugs.
+        These are printed error messages that don't cause the script to crash.
+        """
+        # Common patterns for caught errors
+        soft_error_patterns = [
+            # Explicit error prints
+            r"(?:Runtime\s*)?[Ee]rror\s*(?:[Oo]ccurred|[Hh]appened)?[:\s]+(.+?)(?:\n|$)",
+            r"(?:Exception|Error):\s*(.+?)(?:\n|$)",
+            # Python error types in output (not in traceback)
+            r"(NameError:\s*name\s*'[^']+'\s*is not defined)",
+            r"(TypeError:\s*.+?)(?:\n|$)",
+            r"(ValueError:\s*.+?)(?:\n|$)",
+            r"(AttributeError:\s*.+?)(?:\n|$)",
+            r"(KeyError:\s*.+?)(?:\n|$)",
+            r"(IndexError:\s*.+?)(?:\n|$)",
+            r"(ZeroDivisionError:\s*.+?)(?:\n|$)",
+            r"(FileNotFoundError:\s*.+?)(?:\n|$)",
+        ]
+        
+        # Don't trigger on tracebacks (those are handled separately)
+        if "Traceback (most recent call last):" in output:
+            return None
+        
+        for pattern in soft_error_patterns:
+            match = re.search(pattern, output)
+            if match:
+                error_msg = match.group(1).strip()
+                # Filter out false positives
+                if len(error_msg) > 5 and error_msg.lower() not in ["none", "null", "false"]:
+                    return error_msg
+        
+        return None
 
     def _extract_imports(self, code: str) -> Set[str]:
         """Extract import names from code"""
@@ -296,12 +362,14 @@ builtins.input = _mock_input
         return {self.IMPORT_TO_PIP.get(m, m) for m in modules}
 
     @log_execution(level=20)  # INFO level
-    def execute(self, code: str) -> Dict:
+    def execute(self, code: str, context_files: Dict[str, str] = None) -> Dict:
         """
         Execute Python code safely.
         
         Args:
             code: Python code to execute
+            context_files: Optional dict of {filename: content} for local modules
+                          This allows testing files that import other local files
             
         Returns:
             Dict with success, output, error, and metadata
@@ -317,26 +385,47 @@ builtins.input = _mock_input
         
         # Execute in Docker or locally
         if self.use_docker and self.client and self._sandbox_image_ready:
-            result = self._execute_docker(wrapped_code)
+            result = self._execute_docker(wrapped_code, context_files)
         else:
-            result = self._execute_local(wrapped_code)
+            result = self._execute_local(wrapped_code, context_files)
         
         return result
 
     @log_errors(reraise=False)
-    def _execute_docker(self, code: str) -> Dict:
+    def _execute_docker(self, code: str, context_files: Dict[str, str] = None) -> Dict:
         """Execute code in Docker container with security constraints"""
+        import shutil
         start_time = time.time()
         
-        # Create temp file for code
-        with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode='w') as tmp:
-            tmp.write(code)
-            tmp_path = tmp.name
-
+        # Create temp directory with all files
+        temp_dir = tempfile.mkdtemp(prefix="codesentinel_")
+        main_script = os.path.join(temp_dir, "script.py")
+        
         try:
+            # Write main script
+            with open(main_script, 'w') as f:
+                f.write(code)
+            
+            # Write context files (local modules) to same directory
+            context_module_names = set()
+            if context_files:
+                for filepath, content in context_files.items():
+                    # Flatten path to just filename
+                    base_name = os.path.basename(filepath)
+                    file_path = os.path.join(temp_dir, base_name)
+                    with open(file_path, 'w') as f:
+                        f.write(content)
+                    # Track module name (without .py) so we don't try to pip install it
+                    if base_name.endswith('.py'):
+                        context_module_names.add(base_name[:-3])
+                logger.debug(f"Added {len(context_files)} context files for Docker execution: {context_module_names}")
+            
             # Determine if we need to install any packages
             inferred_modules = self._extract_imports(code)
-            inferred_modules = {m for m in inferred_modules if m not in self.local_modules}
+            # Filter out: stdlib, local modules from executor, AND context files we just added
+            inferred_modules = {m for m in inferred_modules 
+                               if m not in self.local_modules 
+                               and m not in context_module_names}
             missing_modules = inferred_modules - self.dependencies
             
             # Build install command if needed
@@ -358,13 +447,15 @@ builtins.input = _mock_input
                 logger.warning(f"Sandbox image not found, using {image}")
 
             # Run container with security constraints
+            # Mount entire directory so local imports work
             container_config = {
                 "image": image,
                 "command": [
                     "/bin/sh", "-c",
-                    f"{install_cmd}python /app/script.py"
+                    f"cd /app && {install_cmd}python script.py"
                 ],
-                "volumes": {tmp_path: {'bind': '/app/script.py', 'mode': 'ro'}},
+                "volumes": {temp_dir: {'bind': '/app', 'mode': 'ro'}},
+                "working_dir": "/app",
                 "remove": True,
                 "stdout": True,
                 "stderr": True,
@@ -417,6 +508,17 @@ builtins.input = _mock_input
                     "execution_time_ms": execution_time,
                 }
 
+            # Check for "soft errors" - errors caught by try/except but printed
+            soft_error = self._detect_soft_error(output)
+            if soft_error:
+                logger.info(f"Detected soft error in output: {soft_error[:50]}...")
+                return {
+                    "success": False,
+                    "output": output,
+                    "error": f"Runtime error detected (caught by try/except): {soft_error}",
+                    "execution_time_ms": execution_time,
+                }
+            
             logger.info(f"Execution successful in {execution_time}ms")
             return {
                 "success": True,
@@ -473,31 +575,56 @@ builtins.input = _mock_input
             }
 
         finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            # Clean up temp directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     @log_errors(reraise=False)
-    def _execute_local(self, code: str) -> Dict:
+    def _execute_local(self, code: str, context_files: Dict[str, str] = None) -> Dict:
         """Execute code locally (fallback when Docker unavailable)"""
+        import shutil
         logger.warning("Executing locally - this is less secure than Docker")
         start_time = time.time()
         
-        with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode='w') as tmp:
-            tmp.write(code)
-            tmp_path = tmp.name
+        # Create temp directory with all files
+        temp_dir = tempfile.mkdtemp(prefix="codesentinel_local_")
+        main_script = os.path.join(temp_dir, "script.py")
         
         try:
+            # Write main script
+            with open(main_script, 'w') as f:
+                f.write(code)
+            
+            # Write context files (local modules) to same directory
+            if context_files:
+                for filepath, content in context_files.items():
+                    base_name = os.path.basename(filepath)
+                    file_path = os.path.join(temp_dir, base_name)
+                    with open(file_path, 'w') as f:
+                        f.write(content)
+                logger.debug(f"Added {len(context_files)} context files for local execution")
+            
             result = subprocess.run(
-                [sys.executable, tmp_path],
+                [sys.executable, main_script],
                 capture_output=True,
                 text=True,
                 timeout=self.settings.docker.execution_timeout,
-                cwd=os.path.dirname(tmp_path)
+                cwd=temp_dir  # Run from temp dir so local imports work
             )
             
             execution_time = int((time.time() - start_time) * 1000)
             
             if result.returncode == 0:
+                # Check for soft errors in output
+                soft_error = self._detect_soft_error(result.stdout)
+                if soft_error:
+                    logger.info(f"Detected soft error in output: {soft_error[:50]}...")
+                    return {
+                        "success": False,
+                        "output": result.stdout,
+                        "error": f"Runtime error detected (caught by try/except): {soft_error}",
+                        "execution_time_ms": execution_time,
+                    }
                 return {
                     "success": True,
                     "output": result.stdout,
@@ -550,8 +677,9 @@ builtins.input = _mock_input
                 "execution_time_ms": int((time.time() - start_time) * 1000),
             }
         finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            # Clean up temp directory
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     def health_check(self) -> Dict:
         """Check executor health status"""

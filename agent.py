@@ -311,12 +311,53 @@ class CodeSentinel:
             "local_modules": list(self.dependency_detector.local_modules),
         }
     
+    def _find_buggy_file_from_error(self, error_msg: str, all_files: list, original_codes: dict = None) -> str:
+        """
+        Parse error/traceback to find the ACTUAL file where the bug is.
+        Returns the file path if found, empty string otherwise.
+        """
+        import re
+        
+        # Get just the filenames from all_files for matching
+        file_basenames = {os.path.basename(f): f for f in all_files}
+        
+        # Pattern to match Python traceback file references
+        traceback_pattern = r'File ["\']([^"\']+\.py)["\'], line \d+'
+        matches = re.findall(traceback_pattern, error_msg)
+        
+        # Check for filename references in the error
+        for filename in file_basenames:
+            if filename in error_msg and filename not in matches:
+                matches.append(filename)
+        
+        # The LAST file in the traceback is usually where the actual error is
+        for match in reversed(matches):
+            basename = os.path.basename(match)
+            if basename in file_basenames:
+                return file_basenames[basename]
+        
+        # If no file found in traceback, search for the undefined variable in all files
+        # This handles cases where exception is caught and we only see "name 'X' is not defined"
+        name_error_match = re.search(r"name '([^']+)' is not defined", error_msg)
+        if name_error_match and original_codes:
+            undefined_var = name_error_match.group(1)
+            # Search for this variable name in all files
+            for file_path, content in original_codes.items():
+                # Look for the undefined variable being used (not just referenced)
+                # Check if the variable is used but not defined properly
+                if undefined_var in content:
+                    # Check if it looks like a typo (similar variable exists)
+                    # Look for pattern like "return undefined_var" or "= undefined_var"
+                    if re.search(rf'\b{re.escape(undefined_var)}\b', content):
+                        return file_path
+        
+        return ""
+    
     # --- NEW NODE: Test all files and identify failures ---
     def test_all_files(self, state: AgentState):
         print(f"🧪 Testing {len(state.get('all_files', []))} file(s)...")
         all_files = state.get("all_files", [])
         failing_files = []
-        skipped_files = []  # Files skipped due to local module dependencies
         original_codes = {}
         file_errors = {}
         
@@ -329,92 +370,84 @@ class CodeSentinel:
                 "messages": [HumanMessage(content="No Python files found in the repository.")]
             }
         
+        # First, load ALL file contents so we can test with context
+        print("  📂 Loading all files...")
+        for file_path in all_files:
+            try:
+                content = self.repo.get_contents(file_path).decoded_content.decode()
+                original_codes[file_path] = content
+            except Exception as e:
+                print(f"  ⚠️ Could not load {file_path}: {e}")
+                original_codes[file_path] = ""
+        
+        # Now test each file WITH all other files as context (so local imports work)
         for file_path in all_files:
             try:
                 print(f"  Testing: {file_path}")
-                content = self.repo.get_contents(file_path).decoded_content.decode()
+                content = original_codes.get(file_path, "")
                 
-                # Store original code for all files (needed for PR description)
-                original_codes[file_path] = content
-                
-                # Skip files that are likely not executable (e.g., empty files, only comments)
+                # Skip files that are likely not executable
                 if not content.strip() or len(content.strip()) < 10:
                     print(f"  ⏭️  {file_path} skipped (too small or empty)")
                     continue
                 
-                # Test the file
-                result = self.executor.execute(content)
+                # Build context files (all OTHER files in the repo)
+                context_files = {}
+                for other_path, other_content in original_codes.items():
+                    if other_path != file_path and other_content.strip():
+                        context_files[other_path] = other_content
                 
-                # Check if file was skipped due to local module dependency
-                if result.get("skipped_reason") == "local_module_dependency":
-                    missing_module = result.get("missing_module", "unknown")
-                    print(f"  ⏭️  {file_path} skipped (needs local module: {missing_module})")
-                    skipped_files.append(file_path)
-                    continue
+                # Test the file WITH context (so local imports work)
+                result = self.executor.execute(content, context_files=context_files)
                 
                 # Check for warnings (input mocking, etc.) - still counts as passed
                 if result.get("warning") and result.get("success", False):
-                    print(f"  ✅ {file_path} passed (with warning: {result.get('warning')[:50]}...)")
+                    print(f"  ✅ {file_path} passed (with warning)")
                     continue
                 
                 if result.get("error") or not result.get("success", False):
                     error_msg = result.get("error", "Unknown error")
                     
-                    # Double-check: don't add if it's a local module error that slipped through
-                    if "ModuleNotFoundError" in error_msg or "ImportError" in error_msg:
-                        # Check if the missing module is a local one
-                        import re
-                        match = re.search(r"No module named '([^']+)'", error_msg)
-                        if match:
-                            module_name = match.group(1)
-                            # Check if it looks like a local module (exists in repo)
-                            local_module_files = [f.replace('.py', '') for f in all_files]
-                            if module_name in local_module_files or module_name in [f.split('/')[-1].replace('.py', '') for f in all_files]:
-                                print(f"  ⏭️  {file_path} skipped (needs local module: {module_name})")
-                                skipped_files.append(file_path)
-                                continue
+                    # Find the ACTUAL file where the error occurred by parsing traceback
+                    # Pass original_codes so we can search for undefined variables
+                    actual_buggy_file = self._find_buggy_file_from_error(error_msg, all_files, original_codes)
                     
-                    print(f"  ❌ {file_path} failed: {error_msg[:100]}")
-                    failing_files.append(file_path)
-                    file_errors[file_path] = error_msg
+                    if actual_buggy_file and actual_buggy_file != file_path:
+                        # Error is in a DIFFERENT file (e.g., data_pipeline.py when testing analysis_engine.py)
+                        print(f"  ❌ {file_path} failed due to bug in {actual_buggy_file}: {error_msg[:80]}")
+                        if actual_buggy_file not in failing_files:
+                            failing_files.append(actual_buggy_file)
+                            file_errors[actual_buggy_file] = error_msg
+                    else:
+                        # Error is in the file being tested
+                        print(f"  ❌ {file_path} failed: {error_msg[:100]}")
+                        failing_files.append(file_path)
+                        file_errors[file_path] = error_msg
                 else:
                     print(f"  ✅ {file_path} passed")
             except Exception as e:
                 print(f"  ⚠️ Error testing {file_path}: {e}")
-                # Only add to failing if it's a real error, not just import issues
-                error_str = str(e)
-                if "No such file" not in error_str and "ModuleNotFoundError" not in error_str:
-                    failing_files.append(file_path)
-                    file_errors[file_path] = str(e)
-                    # Ensure we have the original code stored
-                    if file_path not in original_codes:
-                        try:
-                            original_codes[file_path] = self.repo.get_contents(file_path).decoded_content.decode()
-                        except:
-                            original_codes[file_path] = ""
+                failing_files.append(file_path)
+                file_errors[file_path] = str(e)
         
         # Print summary
-        passed_count = len(all_files) - len(failing_files) - len(skipped_files)
+        passed_count = len(all_files) - len(failing_files)
         print(f"📊 Test Results:")
         print(f"   ✅ Passed: {passed_count}")
         print(f"   ❌ Failed: {len(failing_files)}")
-        print(f"   ⏭️  Skipped (local dependencies): {len(skipped_files)}")
         print(f"   📁 Total tested: {len(all_files)}")
         
         # Build summary message
         summary_parts = [f"Tested {len(all_files)} file(s)."]
         if failing_files:
-            summary_parts.append(f"Found {len(failing_files)} file(s) with REAL errors that need fixing: {', '.join(failing_files)}")
+            summary_parts.append(f"Found {len(failing_files)} file(s) with errors that need fixing: {', '.join(failing_files)}")
         else:
-            summary_parts.append("No real errors found that need fixing.")
-        if skipped_files:
-            summary_parts.append(f"Skipped {len(skipped_files)} file(s) due to local module dependencies (not bugs): {', '.join(skipped_files)}")
+            summary_parts.append("All files passed! No errors found.")
         
         return {
             "failing_files": failing_files,
             "original_codes": original_codes,
             "file_errors": file_errors,
-            "skipped_files": skipped_files,
             "messages": [HumanMessage(content=" ".join(summary_parts))]
         }
 
@@ -545,37 +578,42 @@ class CodeSentinel:
     def generate_fix(self, state: AgentState):
         signature = "\n\n# CodeSentinal: created for you by RuchirAdnaik."
 
-        # Build comprehensive context
-        related_context = state.get("related_context", "")
-        extra_context = state.get("extra_context", "")
+        # Get the actual error that needs fixing - keep it simple
+        error_msg = state.get("error", "")
+        file_error = state.get("file_errors", {}).get(state.get("file_path", ""), "")
+        actual_error = error_msg or file_error or "Unknown runtime error"
         
-        # Combine all context
-        context_section = ""
-        if related_context:
-            context_section += f"\n\nRELATED FILES (for understanding dependencies and patterns):\n{related_context}"
-        if extra_context:
-            context_section += f"\n\nADDITIONAL CONTEXT:\n{extra_context}"
+        # DO NOT include related files or context - it causes the LLM to merge files!
 
-        # We now pass the documentation + codebase context into the prompt
-        prompt = f"""
-        PROJECT DOCUMENTATION:
-        {state['docs']}
-        
-        {context_section}
+        # Extremely focused prompt - MINIMAL changes only
+        prompt = f"""You are a Python bug fixer. Make the SMALLEST possible fix.
 
-        CODE TO FIX:
-        {state['original_code']}
+FILE TO FIX: {state.get('file_path', 'unknown')}
 
-        INSTRUCTIONS:
-        1. Analyze the code in the context of the entire codebase. Consider how this file relates to other files shown above.
-        2. Identify the runtime error in the code.
-        3. Fix the error while ensuring your changes don't break other files that depend on this one.
-        4. If you see related files above, ensure your fix maintains compatibility with their expectations (function signatures, imports, etc.).
-        5. Ensure your fix follows any coding standards or rules mentioned in the PROJECT DOCUMENTATION above.
-        6. Return ONLY the full corrected python code in a markdown block.
-        7. MANDATORY: You must add the following comment as the very last line of the code:
-           # CodeSentinal: created for you by RuchirAdnaik.
-        """
+```python
+{state['original_code']}
+```
+
+ERROR:
+{actual_error}
+
+RULES (FOLLOW EXACTLY):
+1. Find the ONE line causing the error
+2. Fix ONLY that line - change 1-5 characters maximum if possible
+3. DO NOT remove any imports
+4. DO NOT add code from other files
+5. DO NOT merge files together
+6. DO NOT refactor or reorganize
+7. DO NOT add comments except the signature
+8. Keep the file structure EXACTLY the same
+
+COMMON FIXES:
+- NameError "name 'X' is not defined": You probably have a typo. Look for a variable with a similar name.
+- Example: "data_set" should be "dataset" (typo fix, not restructure)
+
+Return the COMPLETE file with ONLY the minimal fix applied.
+End with: # CodeSentinal: created for you by RuchirAdnaik.
+"""
         
         if state.get("error"):
             prompt += f"\n\nYour last attempt failed with this error: {state['error']}. Please try again."
@@ -600,14 +638,22 @@ class CodeSentinel:
     # --- Node: Execute ---
     def execute_test(self, state: AgentState):
         print(f"⚙️ Testing fix in Docker (Attempt {state['iterations']})...")
-        result = self.executor.execute(state["code"])
+        
+        # Build context files from original_codes (other files in the repo)
+        original_codes = state.get("original_codes", {})
+        current_file = state.get("file_path", "")
+        context_files = {}
+        for file_path, content in original_codes.items():
+            if file_path != current_file and content.strip():
+                context_files[file_path] = content
+        
+        result = self.executor.execute(state["code"], context_files=context_files)
     
         # If there's no error, we MUST return an empty string, not None
         error_value = result["error"] if result["error"] else ""
         
         # Update file_errors dict with the current error (if any)
         file_errors = state.get("file_errors", {}).copy()
-        current_file = state.get("file_path", "")
         if error_value and current_file:
             file_errors[current_file] = error_value
         
