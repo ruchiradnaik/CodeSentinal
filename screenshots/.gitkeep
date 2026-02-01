@@ -1,0 +1,18 @@
+# Screenshots Folder
+
+Add your screenshots here with these names:
+- 01_main_dashboard.png
+- 02_fix_code_mode.png
+- 03_before_fix.png
+- 04_after_fix.png
+- 05_create_project.png
+- 06_chat_mode.png
+- 07_local_files.png
+- 08_pr_created.png
+
+Tips for good screenshots:
+1. Use a clean browser window (hide bookmarks bar)
+2. Use full-width view (F11 for fullscreen)
+3. Capture at 1920x1080 or similar resolution
+4. Show real data (not placeholder text)
+5. Crop to focus on the important parts
