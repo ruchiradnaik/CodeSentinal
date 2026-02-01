@@ -31,6 +31,20 @@
 
 ### 🔧 Fix Code Mode
 ![Fix Code Mode](screenshots/02_fix_code_mode.png)
+
+
+![Fix Code Mode](screenshots/03_fix_code_mode.png)
+
+
+![Fix Code Mode](screenshots/04_fix_code_mode.png)
+
+
+![Fix Code Mode](screenshots/05_fix_code_mode.png)
+
+
+![Fix Code Mode](screenshots/06_fix_code_mode.png)
+
+
 *Connect to GitHub repo, auto-detect errors, and see real-time fixing progress*
 
 ---
@@ -39,6 +53,9 @@
 | Before (Errors) | After (Fixed) |
 |-----------------|---------------|
 | ![Before](screenshots/03_before_fix.png) | ![After](screenshots/04_after_fix.png) |
+
+
+![Fix](screenshots/05_after_fix.png)
 
 *AI analyzes errors and generates intelligent fixes with full context*
 
