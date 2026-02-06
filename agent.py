@@ -586,7 +586,7 @@ class CodeSentinel:
         # DO NOT include related files or context - it causes the LLM to merge files!
 
         # Extremely focused prompt - MINIMAL changes only
-        prompt = f"""You are a Python bug fixer. Make the SMALLEST possible fix.
+        prompt = f"""You are a Python bug fixer. Make the SMALLEST and USEFUL and ACCURATE possible fix.
 
 FILE TO FIX: {state.get('file_path', 'unknown')}
 
