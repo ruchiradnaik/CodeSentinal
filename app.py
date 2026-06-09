@@ -540,16 +540,6 @@ st.markdown("""
         }
     }
 </style>
-
-<script>
-    // Auto-scroll to bottom of page when new content is added
-    const scrollToBottom = () => {
-        window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});
-    };
-    setTimeout(scrollToBottom, 100);
-    const observer = new MutationObserver(scrollToBottom);
-    observer.observe(document.body, {childList: true, subtree: true});
-</script>
 """, unsafe_allow_html=True)
 
 # --- Session State Initialization ---
