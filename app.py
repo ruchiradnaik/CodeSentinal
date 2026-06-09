@@ -23,6 +23,11 @@ from logger import get_logger, setup_logging
 
 load_dotenv()
 
+import re as _re
+def _safe_err(e) -> str:
+    """Redact API keys and tokens from exception messages before displaying."""
+    return _re.sub(r'(sk-[a-zA-Z0-9\-_]+|ghp_[a-zA-Z0-9]+|Bearer [a-zA-Z0-9\-_]+)', '[REDACTED]', str(e))
+
 # --- Initialize logging and configuration ---
 settings = get_settings()
 logger = get_logger("app")
@@ -908,7 +913,7 @@ with st.sidebar:
                 
                 st.caption(f"Plan: {user.plan.name if user.plan else 'Free'}")
         except Exception as e:
-            st.warning(f"⚠️ Token issue: {str(e)[:30]}...")
+            st.warning(f"⚠️ Token issue: {_safe_err(e)[:40]}...")
     else:
         st.error("❌ GitHub Token Missing")
         with st.expander("🔑 Setup Instructions"):
@@ -949,7 +954,7 @@ with st.sidebar:
                         st.session_state.repo_structure = get_repo_structure(repo)
                         st.success("Structure loaded!")
                     except Exception as e:
-                        st.error(f"Error: {e}")
+                        st.error(f"Error: {_safe_err(e)}")
     
     elif "Create Project" in mode:
         st.subheader("🏗️ Project Options")
@@ -1194,10 +1199,7 @@ I'm your AI coding assistant, specialized **only** in software development topic
                             
                         except Exception as e:
                             status.update(label="❌ Error", state="error")
-                            st.error(f"Error: {str(e)}")
-                            import traceback
-                            with st.expander("🔍 Error Details"):
-                                st.code(traceback.format_exc())
+                            st.error(f"Error: {_safe_err(e)}")
             
             # ==================== CREATE PROJECT MODE ====================
             elif "Create Project" in mode:
@@ -1250,7 +1252,7 @@ I'm your AI coding assistant, specialized **only** in software development topic
                         
                         except Exception as e:
                             status.update(label="❌ Error", state="error")
-                            st.error(f"Error: {str(e)}")
+                            st.error(f"Error: {_safe_err(e)}")
                 
                 else:
                     with st.status("🏗️ Building Project...", expanded=True) as status:
@@ -1301,7 +1303,7 @@ I'm your AI coding assistant, specialized **only** in software development topic
                         
                         except Exception as e:
                             status.update(label="❌ Error", state="error")
-                            st.error(f"Error: {str(e)}")
+                            st.error(f"Error: {_safe_err(e)}")
             
             # ==================== LOCAL FILES MODE ====================
             elif "Local Files" in mode:
@@ -1389,7 +1391,7 @@ I'm your AI coding assistant, specialized **only** in software development topic
                             
                             except Exception as e:
                                 status.update(label="❌ Error", state="error")
-                                st.error(f"Error: {str(e)}")
+                                st.error(f"Error: {_safe_err(e)}")
                 else:
                     st.info("👈 Upload Python files in the sidebar to analyze them!")
             
